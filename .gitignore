@@ -1,0 +1,69 @@
+# ==============================================================================
+# Git Ignore Configuration - HEVC Analysis Tool & HM-16.0
+# ==============================================================================
+
+# Python Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+web_app/backend/venv/
+web_app/backend/.venv/
+
+# Node Dependencies and Builds
+node_modules/
+web_app/frontend/node_modules/
+web_app/frontend/dist/
+dist/
+
+# Python Cache & Testing Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+web_app/backend/.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Workspace Sessions & Temporary Data
+workspace/temp/
+workspace/sessions/
+workspace/inputs/*
+!workspace/inputs/.gitkeep
+workspace/*.yuv
+workspace/*.bin
+
+# Video Streams, Reconstructed YUV, and Dump Files
+dec.yuv
+rec.yuv
+str.bin
+*.yuv
+*.bin
+dump_data/
+*.log
+
+# C++ Build Outputs & Binaries
+/build/
+/bin/
+/lib/
+core
+deploy/
+*.o
+*.a
+*.dylib
+*.exe
+
+# IDE, Editor, and OS Metadata
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.suo
+*.sdf
+*.opensdf
+*.user
+.vs/
