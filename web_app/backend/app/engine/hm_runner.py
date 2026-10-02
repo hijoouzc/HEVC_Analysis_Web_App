@@ -36,10 +36,14 @@ class HMEncoderRunner:
         env["VISUAL_DUMP_EXIT"] = "0"
         env["VISUAL_OUTPUT_DIR"] = str(session_dir)
         
+        recon_output = session_dir / "recon.yuv"
+        bitstream_output = session_dir / "str.bin"
         cmd = [
             str(self.encoder_bin),
             "-c", str(self.cfg_path),
             "-i", str(yuv_input),
+            "-o", str(recon_output),
+            "-b", str(bitstream_output),
             "-wdt", str(frame_meta.aligned_width),
             "-hgt", str(frame_meta.aligned_height),
             "-fr", str(settings.DEFAULT_FPS),
@@ -54,7 +58,15 @@ class HMEncoderRunner:
             env=env
         )
         
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            raise EncoderExecutionError("HM reference encoder process timed out after 120 seconds.", -1)
         
         # Also copy trace to legacy dump_data/trace.jsonl for compatibility with direct file observers
         if trace_output.exists() and trace_output.stat().st_size > 0:

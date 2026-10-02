@@ -87,4 +87,53 @@ class FFmpegAdapter:
             chroma_format="420"
         )
 
+    async def convert_yuv_to_png(self, yuv_file: Path, png_output: Path, width: int, height: int) -> Path:
+        """Converts raw YUV420p video frame to PNG image"""
+        if not yuv_file.exists():
+            return png_output
+        png_output.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo",
+            "-s", f"{width}x{height}",
+            "-pix_fmt", "yuv420p",
+            "-i", str(yuv_file),
+            "-vframes", "1",
+            str(png_output)
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await proc.communicate()
+        return png_output
+
+    async def extract_yuv_planes(self, yuv_file: Path, output_dir: Path, width: int, height: int) -> dict[str, Path]:
+        """Extracts Y (Luma), U (Cb), V (Cr) planes into individual PNG images"""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        y_out = output_dir / "plane_y.png"
+        u_out = output_dir / "plane_u.png"
+        v_out = output_dir / "plane_v.png"
+        if not yuv_file.exists():
+            return {"y": y_out, "u": u_out, "v": v_out}
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo",
+            "-s", f"{width}x{height}",
+            "-pix_fmt", "yuv420p",
+            "-i", str(yuv_file),
+            "-filter_complex", "[0:v]extractplanes=y+u+v[y][u][v]",
+            "-map", "[y]", str(y_out),
+            "-map", "[u]", str(u_out),
+            "-map", "[v]", str(v_out)
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await proc.communicate()
+        return {"y": y_out, "u": u_out, "v": v_out}
+
 ffmpeg_adapter = FFmpegAdapter()

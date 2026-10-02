@@ -44,6 +44,93 @@ class AnalysisService:
         self.registry = registry or checkpoint_registry
         self.job_mgr = job_mgr or job_manager
 
+    @staticmethod
+    def compute_frame_dimensions(orig_w: int, orig_h: int, scale_mode: str) -> tuple[int, int]:
+        """Compute aligned width & height conforming to HEVC 8-pixel alignment and scale_mode."""
+        if scale_mode == "fast":
+            target_max_w, target_max_h = 640, 360
+            if orig_w > target_max_w or orig_h > target_max_h:
+                scale = min(target_max_w / orig_w, target_max_h / orig_h)
+                calc_w = max(64, int(orig_w * scale))
+                calc_h = max(64, int(orig_h * scale))
+            else:
+                calc_w, calc_h = orig_w, orig_h
+        else:
+            calc_w, calc_h = orig_w, orig_h
+
+        calc_w = max(64, round(calc_w / 8) * 8)
+        calc_h = max(64, round(calc_h / 8) * 8)
+        return calc_w, calc_h
+
+    def _resolve_target_roi(
+        self,
+        job_id: str,
+        cu_size: int | None = None,
+        ctu_x: int | None = None,
+        ctu_y: int | None = None,
+    ) -> tuple[int | None, int | None, int | None]:
+        """Resolve ROI parameters from explicit args or fallback to the job's recorded ROI."""
+        target_cu, target_x, target_y = cu_size, ctu_x, ctu_y
+        if target_cu is None or target_x is None or target_y is None:
+            job = self.job_mgr._jobs.get(job_id)
+            if job and job.roi:
+                if target_cu is None and job.roi.cu_size > 0:
+                    target_cu = job.roi.cu_size
+                if target_x is None:
+                    target_x = job.roi.ctu_x
+                if target_y is None:
+                    target_y = job.roi.ctu_y
+        return target_cu, target_x, target_y
+
+    @staticmethod
+    def _build_roi_predicate(
+        event_name: str | None = None,
+        cu_size: int | None = None,
+        ctu_x: int | None = None,
+        ctu_y: int | None = None,
+    ):
+        """Create a predicate function to filter trace events by event name and ROI."""
+        def predicate(e: dict) -> bool:
+            if event_name is not None and e.get("event") != event_name:
+                return False
+            if cu_size is not None and e.get("cu_size") != cu_size:
+                return False
+            if ctu_x is not None and e.get("ctu_x") != ctu_x:
+                return False
+            if ctu_y is not None and e.get("ctu_y") != ctu_y:
+                return False
+            return True
+        return predicate
+
+    @staticmethod
+    def _build_fallback_ref_checkpoint(raw_mode: dict) -> IntraRefCheckpoint:
+        """Construct IntraRefCheckpoint from RDO_INTRA_SEARCH event when INTRA_REF_SAMPLES is absent."""
+        ref_top = raw_mode.get("ref_top", [])
+        ref_left = raw_mode.get("ref_left", [])
+        ref_top_u = raw_mode.get("ref_top_u", [])
+        ref_left_u = raw_mode.get("ref_left_u", [])
+        ref_top_v = raw_mode.get("ref_top_v", [])
+        ref_left_v = raw_mode.get("ref_left_v", [])
+        return IntraRefCheckpoint(
+            poc=raw_mode.get("poc", 0),
+            ctu_x=raw_mode.get("ctu_x", 0),
+            ctu_y=raw_mode.get("ctu_y", 0),
+            cu_size=raw_mode.get("cu_size", 8),
+            ref_unfilt_top=ref_top,
+            ref_unfilt_left=ref_left,
+            ref_filt_top=ref_top,
+            ref_filt_left=ref_left,
+            ref_unfilt_top_u=ref_top_u,
+            ref_unfilt_left_u=ref_left_u,
+            ref_unfilt_top_v=ref_top_v,
+            ref_unfilt_left_v=ref_left_v,
+            ref_filt_top_u=ref_top_u,
+            ref_filt_left_u=ref_left_u,
+            ref_filt_top_v=ref_top_v,
+            ref_filt_left_v=ref_left_v,
+            luma_ref_count=len(ref_top)
+        )
+
     async def execute_analysis_pipeline(
         self,
         job_id: str,
@@ -73,8 +160,16 @@ class AnalysisService:
                 roi=roi
             )
             
-            # 3. Read trace events
-            raw_modes = self.reader.read_all(trace_path, event_filter="RDO_INTRA_SEARCH", limit=35)
+            # 3. Read trace events matching target cu_size
+            target_cu_size = roi.cu_size if roi.cu_size > 0 else 8
+            raw_modes = self.reader.read_all(
+                trace_path,
+                event_filter="RDO_INTRA_SEARCH",
+                limit=35,
+                predicate=lambda e: e.get("cu_size") == target_cu_size
+            )
+            if not raw_modes:
+                raw_modes = self.reader.read_all(trace_path, event_filter="RDO_INTRA_SEARCH", limit=35)
             if not raw_modes:
                 raise EncoderExecutionError("No Intra Search trace events were captured from encoder.")
                 
@@ -127,23 +222,7 @@ class AnalysisService:
         with Image.open(input_image) as img:
             orig_w, orig_h = img.size
             
-        if scale_mode == "fast":
-            target_max_w = 640
-            target_max_h = 360
-            if orig_w > target_max_w or orig_h > target_max_h:
-                scale = min(target_max_w / orig_w, target_max_h / orig_h)
-                calc_w = max(64, int(orig_w * scale))
-                calc_h = max(64, int(orig_h * scale))
-            else:
-                calc_w = orig_w
-                calc_h = orig_h
-        else:
-            calc_w = orig_w
-            calc_h = orig_h
-
-        calc_w = max(64, round(calc_w / 8) * 8)
-        calc_h = max(64, round(calc_h / 8) * 8)
-
+        calc_w, calc_h = self.compute_frame_dimensions(orig_w, orig_h, scale_mode)
         num_ctu_w = (calc_w + 63) // 64
         num_ctu_h = (calc_h + 63) // 64
 
@@ -162,7 +241,22 @@ class AnalysisService:
         
         # Retrieve raw modes for legacy format
         trace_path = self.storage.get_trace_path(job_id)
-        raw_modes = self.reader.read_all(trace_path, event_filter="RDO_INTRA_SEARCH", limit=35)
+        target_cu_size = roi.cu_size if roi.cu_size > 0 else 8
+        raw_modes = self.reader.read_all(
+            trace_path,
+            event_filter="RDO_INTRA_SEARCH",
+            limit=35,
+            predicate=lambda e: e.get("cu_size") == target_cu_size
+        )
+        if not raw_modes:
+            raw_modes = self.reader.read_all(trace_path, event_filter="RDO_INTRA_SEARCH", limit=35)
+        
+        # Retrieve intra ref data if available
+        ref_checkpoint = None
+        try:
+            ref_checkpoint = self.get_intra_ref_data(job_id, cu_size=target_cu_size, ctu_x=roi.ctu_x, ctu_y=roi.ctu_y)
+        except Exception:
+            pass
         
         return LegacyAnalysisResponse(
             status="success",
@@ -173,15 +267,31 @@ class AnalysisService:
             ctu_x=job_info.roi.ctu_x,
             ctu_y=job_info.roi.ctu_y,
             best_mode=job_info.best_mode or 0,
-            best_cost=job_info.best_cost or 0.0
+            best_cost=job_info.best_cost or 0.0,
+            ref_samples=ref_checkpoint.model_dump() if ref_checkpoint else None
         )
 
-    def get_intra_search_data(self, job_id: str, mode: int | None = None) -> list[IntraModeData]:
+    def get_intra_search_data(
+        self,
+        job_id: str,
+        mode: int | None = None,
+        cu_size: int | None = None,
+        ctu_x: int | None = None,
+        ctu_y: int | None = None
+    ) -> list[IntraModeData]:
         trace_path = self.storage.get_trace_path(job_id)
         if not trace_path.exists():
             raise JobNotFoundError(job_id)
             
-        raw_modes = self.reader.read_all(trace_path, event_filter="RDO_INTRA_SEARCH", limit=35)
+        target_cu, target_x, target_y = self._resolve_target_roi(job_id, cu_size, ctu_x, ctu_y)
+        predicate = None
+        if target_cu is not None or target_x is not None or target_y is not None:
+            predicate = self._build_roi_predicate(cu_size=target_cu, ctu_x=target_x, ctu_y=target_y)
+
+        raw_modes = self.reader.read_all(trace_path, event_filter="RDO_INTRA_SEARCH", limit=35, predicate=predicate)
+        if not raw_modes and predicate is not None:
+            raw_modes = self.reader.read_all(trace_path, event_filter="RDO_INTRA_SEARCH", limit=35)
+            
         parsed = [intra_search_parser.parse_event(m) for m in raw_modes]
         ranked = intra_search_parser.enrich_and_rank(parsed)
         
@@ -193,40 +303,51 @@ class AnalysisService:
         modes = self.get_intra_search_data(job_id)
         return intra_search_parser.compute_summary(modes)
 
-    def get_intra_ref_data(self, job_id: str) -> IntraRefCheckpoint:
+    def get_intra_ref_data(
+        self,
+        job_id: str,
+        cu_size: int | None = None,
+        ctu_x: int | None = None,
+        ctu_y: int | None = None
+    ) -> IntraRefCheckpoint:
         trace_path = self.storage.get_trace_path(job_id)
         if not trace_path.exists():
             raise JobNotFoundError(job_id)
             
-        raw_ref = self.reader.find_one(trace_path, lambda e: e.get("event") == "INTRA_REF_SAMPLES")
+        target_cu, target_x, target_y = self._resolve_target_roi(job_id, cu_size, ctu_x, ctu_y)
+        ref_pred = self._build_roi_predicate(
+            event_name="INTRA_REF_SAMPLES",
+            cu_size=target_cu,
+            ctu_x=target_x,
+            ctu_y=target_y
+        )
+
+        raw_ref = self.reader.find_one(trace_path, ref_pred)
         if not raw_ref:
-            raw_mode = self.reader.find_one(trace_path, lambda e: e.get("event") == "RDO_INTRA_SEARCH")
+            raw_ref = self.reader.find_one(trace_path, lambda e: e.get("event") == "INTRA_REF_SAMPLES")
+            
+        if not raw_ref:
+            rdo_pred = self._build_roi_predicate(
+                event_name="RDO_INTRA_SEARCH",
+                cu_size=target_cu
+            )
+            raw_mode = self.reader.find_one(trace_path, rdo_pred)
+            if not raw_mode:
+                raw_mode = self.reader.find_one(trace_path, lambda e: e.get("event") == "RDO_INTRA_SEARCH")
             if not raw_mode:
                 raise JobNotFoundError(job_id)
-            return IntraRefCheckpoint(
-                poc=raw_mode.get("poc", 0),
-                ctu_x=raw_mode.get("ctu_x", 0),
-                ctu_y=raw_mode.get("ctu_y", 0),
-                cu_size=raw_mode.get("cu_size", 8),
-                ref_unfilt_top=raw_mode.get("ref_top", []),
-                ref_unfilt_left=raw_mode.get("ref_left", []),
-                ref_filt_top=raw_mode.get("ref_top", []),
-                ref_filt_left=raw_mode.get("ref_left", []),
-                ref_unfilt_top_u=raw_mode.get("ref_top_u", []),
-                ref_unfilt_left_u=raw_mode.get("ref_left_u", []),
-                ref_unfilt_top_v=raw_mode.get("ref_top_v", []),
-                ref_unfilt_left_v=raw_mode.get("ref_left_v", []),
-                ref_filt_top_u=raw_mode.get("ref_top_u", []),
-                ref_filt_left_u=raw_mode.get("ref_left_u", []),
-                ref_filt_top_v=raw_mode.get("ref_top_v", []),
-                ref_filt_left_v=raw_mode.get("ref_left_v", []),
-                luma_ref_count=len(raw_mode.get("ref_top", []))
-            )
+            return self._build_fallback_ref_checkpoint(raw_mode)
             
         return intra_ref_parser.parse_event(raw_ref)
 
-    def compare_intra_modes(self, job_id: str, mode_a: int, mode_b: int) -> IntraComparisonResult:
-        modes = self.get_intra_search_data(job_id)
+    def compare_intra_modes(
+        self,
+        job_id: str,
+        mode_a: int,
+        mode_b: int,
+        cu_size: int | None = None
+    ) -> IntraComparisonResult:
+        modes = self.get_intra_search_data(job_id, cu_size=cu_size)
         m_a = next((m for m in modes if m.mode == mode_a), None)
         m_b = next((m for m in modes if m.mode == mode_b), None)
         
@@ -283,15 +404,16 @@ class AnalysisService:
         raw_parts = self.reader.read_all(trace_path, event_filter="CTU_PARTITION")
         return [partition_parser.parse_event(p) for p in raw_parts]
 
-    def get_transform_quant_data(self, job_id: str, comp: str = "Y") -> list[TransformQuantCheckpoint]:
+    def get_transform_quant_data(self, job_id: str, comp: str | None = None) -> list[TransformQuantCheckpoint]:
         trace_path = self.storage.get_trace_path(job_id)
         if not trace_path.exists():
             raise JobNotFoundError(job_id)
             
         raw_events = self.reader.read_all(trace_path, event_filter="TRANSFORM_QUANT")
         parsed = [transform_quant_parser.parse_event(e) for e in raw_events]
-        if comp:
-            return [t for t in parsed if t.component == comp]
+        if comp and comp.strip():
+            target_comp = comp.strip().upper()
+            return [t for t in parsed if t.component.upper() == target_comp]
         return parsed
 
 analysis_service = AnalysisService()

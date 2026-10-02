@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { SELECTION_HIGHLIGHT_COLOR } from '../utils/colorUtils';
 
 /**
  * TransformQuantVisualizer (CP_06_TRANSFORM & CP_07_QUANT)
@@ -10,14 +11,18 @@ import React, { useState } from 'react';
 export default function TransformQuantVisualizer({
   transformData = [],
   quantData = [],
-  ctuX = 0,
-  ctuY = 0,
+  _ctuX = 0,
+  _ctuY = 0,
   targetTuX = undefined,
   targetTuY = undefined
 }) {
   const [activeComp, setActiveComp] = useState('Y'); // 'Y', 'Cb', 'Cr'
   const [userSelectedTuIdx, setUserSelectedTuIdx] = useState(null);
-  const [hoveredCell, setHoveredCell] = useState(null); // { x, y }
+  const [selectedCell, setSelectedCell] = useState(null); // { x, y }
+
+  const handleCellClick = (coord) => {
+    setSelectedCell(prev => (prev && prev.x === coord.x && prev.y === coord.y ? null : coord));
+  };
 
   // Filter events by selected component (supporting either transformData or quantData)
   const allEvents = (transformData && transformData.length > 0) ? transformData : (quantData || []);
@@ -49,8 +54,8 @@ export default function TransformQuantVisualizer({
     width = 8,
     height = 8,
     qp = 32,
-    tu_x = 0,
-    tu_y = 0,
+    tu_x: _tu_x = 0,
+    tu_y: _tu_y = 0,
     resi_matrix = [],
     dct_coeff = [],
     quant_coeff = [],
@@ -107,9 +112,9 @@ export default function TransformQuantVisualizer({
     };
   };
 
-  const zeroCoeffCount = (width * height) - sig_coeff_count;
-  const sparsityPercent = (sparsity_ratio * 100).toFixed(1);
-  const energyPercent = (energy_compaction_ratio * 100).toFixed(1);
+  const zeroCoeffCount = (width * height) - (sig_coeff_count ?? 0);
+  const sparsityPercent = typeof sparsity_ratio === 'number' ? (sparsity_ratio * 100).toFixed(1) : '—';
+  const energyPercent = typeof energy_compaction_ratio === 'number' ? (energy_compaction_ratio * 100).toFixed(1) : '—';
 
   return (
     <div className="transform-quant-container" style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
@@ -135,6 +140,7 @@ export default function TransformQuantVisualizer({
               onClick={() => {
                 setActiveComp(comp);
                 setUserSelectedTuIdx(0);
+                setSelectedCell(null);
               }}
               style={{
                 padding: '0.35rem 0.85rem',
@@ -189,25 +195,24 @@ export default function TransformQuantVisualizer({
         <div>
           <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', color: '#666', fontWeight: 700 }}>Transform Unit</div>
           <div style={{ fontSize: '1.3rem', fontWeight: 800 }}>{width} × {height} ({activeComp})</div>
-          <div style={{ fontSize: '0.75rem', color: '#888' }}>Offset: ({tu_x}, {tu_y}) in CTU ({ctuX}, {ctuY}) | QP: {qp}</div>
+          <div style={{ fontSize: '0.75rem', color: '#888' }}>QP {qp}</div>
         </div>
 
         <div>
           <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', color: '#666', fontWeight: 700 }}>Energy Compaction</div>
           <div style={{ fontSize: '1.3rem', fontWeight: 800, color: 'var(--c-blue)' }}>{energyPercent}%</div>
-          <div style={{ fontSize: '0.75rem', color: '#888' }}>DC = {dc_coeff} (Harmonic 0,0)</div>
+          <div style={{ fontSize: '0.75rem', color: '#888' }}>DC = {dc_coeff}</div>
         </div>
 
         <div>
           <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', color: '#666', fontWeight: 700 }}>Quantization Sparsity</div>
           <div style={{ fontSize: '1.3rem', fontWeight: 800, color: 'var(--c-magenta)' }}>{sparsityPercent}%</div>
-          <div style={{ fontSize: '0.75rem', color: '#888' }}>{zeroCoeffCount} zeros / {width * height} coeffs</div>
+          <div style={{ fontSize: '0.75rem', color: '#888' }}>{zeroCoeffCount} / {width * height} zeros</div>
         </div>
 
         <div>
           <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', color: '#666', fontWeight: 700 }}>Non-Zero Levels</div>
           <div style={{ fontSize: '1.3rem', fontWeight: 800, color: '#16A34A' }}>{sig_coeff_count} coeffs</div>
-          <div style={{ fontSize: '0.75rem', color: '#888' }}>CABAC Entropy Target</div>
         </div>
       </div>
 
@@ -229,28 +234,26 @@ export default function TransformQuantVisualizer({
             <h4 style={{ fontSize: '0.95rem', textTransform: 'uppercase', fontWeight: 800 }}>
               1. Spatial Residual R(x, y)
             </h4>
-            <span style={{ fontSize: '0.75rem', color: '#666' }}>O(x,y) - P(x,y)</span>
           </div>
 
           <div style={{
             display: 'grid',
             gridTemplateColumns: `repeat(${width}, 1fr)`,
-            gap: '2px',
-            background: 'var(--c-black)',
+            gap: '1px',
+            background: '#CBD5E1',
             padding: '2px',
-            border: '2px solid var(--c-black)',
+            border: '2px solid #0F172A',
             aspectRatio: '1/1'
           }}>
             {resi_matrix.map((val, idx) => {
               const x = idx % width;
               const y = Math.floor(idx / width);
-              const isHovered = hoveredCell && hoveredCell.x === x && hoveredCell.y === y;
+              const isSelected = selectedCell && selectedCell.x === x && selectedCell.y === y;
               const style = getResiColor(val);
               return (
                 <div
                   key={`resi-${idx}`}
-                  onMouseEnter={() => setHoveredCell({ x, y })}
-                  onMouseLeave={() => setHoveredCell(null)}
+                  onClick={() => handleCellClick({ x, y })}
                   style={{
                     backgroundColor: style.bg,
                     color: style.color,
@@ -265,8 +268,10 @@ export default function TransformQuantVisualizer({
                     whiteSpace: 'nowrap',
                     textOverflow: 'clip',
                     padding: '1px',
-                    outline: isHovered ? '2px solid var(--c-black)' : 'none',
-                    zIndex: isHovered ? 5 : 1,
+                    outline: isSelected ? `2px solid ${SELECTION_HIGHLIGHT_COLOR}` : 'none',
+                    boxShadow: 'none',
+                    zIndex: isSelected ? 10 : 1,
+                    cursor: 'pointer',
                     userSelect: 'none'
                   }}
                   title={`Residual (${x}, ${y}): ${val}`}
@@ -303,23 +308,22 @@ export default function TransformQuantVisualizer({
           <div style={{
             display: 'grid',
             gridTemplateColumns: `repeat(${width}, 1fr)`,
-            gap: '2px',
-            background: 'var(--c-black)',
+            gap: '1px',
+            background: '#CBD5E1',
             padding: '2px',
-            border: '2px solid var(--c-black)',
+            border: '2px solid #0F172A',
             aspectRatio: '1/1'
           }}>
             {dct_coeff.map((val, idx) => {
               const u = idx % width;
               const v = Math.floor(idx / width);
               const isDC = (u === 0 && v === 0);
-              const isHovered = hoveredCell && hoveredCell.x === u && hoveredCell.y === v;
+              const isSelected = selectedCell && selectedCell.x === u && selectedCell.y === v;
               const style = getDctColor(val, isDC);
               return (
                 <div
                   key={`dct-${idx}`}
-                  onMouseEnter={() => setHoveredCell({ x: u, y: v })}
-                  onMouseLeave={() => setHoveredCell(null)}
+                  onClick={() => handleCellClick({ x: u, y: v })}
                   style={{
                     backgroundColor: style.bg,
                     color: style.color,
@@ -334,8 +338,10 @@ export default function TransformQuantVisualizer({
                     whiteSpace: 'nowrap',
                     textOverflow: 'clip',
                     padding: '1px',
-                    outline: isHovered ? '2px solid var(--c-black)' : (isDC ? '2px solid #000' : 'none'),
-                    zIndex: isHovered ? 5 : 1,
+                    outline: isSelected ? `2px solid ${SELECTION_HIGHLIGHT_COLOR}` : (isDC ? '1.5px solid #0F172A' : 'none'),
+                    boxShadow: 'none',
+                    zIndex: isSelected ? 10 : 1,
+                    cursor: 'pointer',
                     userSelect: 'none'
                   }}
                   title={`${isDst ? 'DST' : 'DCT'} (${u}, ${v}) [${isDC ? 'DC' : 'AC'}]: ${val}`}
@@ -377,22 +383,21 @@ export default function TransformQuantVisualizer({
           <div style={{
             display: 'grid',
             gridTemplateColumns: `repeat(${width}, 1fr)`,
-            gap: '2px',
-            background: 'var(--c-black)',
+            gap: '1px',
+            background: '#CBD5E1',
             padding: '2px',
-            border: '2px solid var(--c-black)',
+            border: '2px solid #0F172A',
             aspectRatio: '1/1'
           }}>
             {quant_coeff.map((val, idx) => {
               const u = idx % width;
               const v = Math.floor(idx / width);
-              const isHovered = hoveredCell && hoveredCell.x === u && hoveredCell.y === v;
+              const isSelected = selectedCell && selectedCell.x === u && selectedCell.y === v;
               const style = getQuantColor(val);
               return (
                 <div
                   key={`quant-${idx}`}
-                  onMouseEnter={() => setHoveredCell({ x: u, y: v })}
-                  onMouseLeave={() => setHoveredCell(null)}
+                  onClick={() => handleCellClick({ x: u, y: v })}
                   style={{
                     backgroundColor: style.bg,
                     color: style.color,
@@ -407,8 +412,10 @@ export default function TransformQuantVisualizer({
                     whiteSpace: 'nowrap',
                     textOverflow: 'clip',
                     padding: '1px',
-                    outline: isHovered ? '2px solid var(--c-black)' : 'none',
-                    zIndex: isHovered ? 5 : 1,
+                    outline: isSelected ? `2px solid ${SELECTION_HIGHLIGHT_COLOR}` : 'none',
+                    boxShadow: 'none',
+                    zIndex: isSelected ? 10 : 1,
+                    cursor: 'pointer',
                     userSelect: 'none'
                   }}
                   title={`QCoeff (${u}, ${v}): ${val}`}
@@ -434,51 +441,44 @@ export default function TransformQuantVisualizer({
           {sig_coeff_count === 0 && (
             <div style={{
               marginTop: '0.75rem',
-              padding: '0.5rem 0.75rem',
+              padding: '0.4rem 0.75rem',
               background: '#ECFDF5',
               border: '1.5px solid #10B981',
               borderRadius: '4px',
               textAlign: 'center'
             }}>
-              <span style={{ color: '#047857', fontWeight: 800, fontSize: '0.8rem' }}>
-                CBF_{activeComp} = 0 (All-Zero Block)
+              <span style={{ color: '#047857', fontWeight: 800, fontSize: '0.75rem' }}>
+                CBF_{activeComp} = 0 • All coefficients zero
               </span>
-              <p style={{ margin: '0.2rem 0 0 0', fontSize: '0.7rem', color: '#065F46' }}>
-                Toàn bộ {width * height} hệ số bị triệt tiêu về 0! CABAC tốn đúng 0 bit cho hệ số biến đổi. Rec = Pred.
-              </p>
             </div>
           )}
         </div>
       </div>
 
-      {/* Academic RDOQ & Dead-Zone Analysis Banner */}
-      <div style={{
-        padding: '1rem 1.25rem',
-        background: '#FFFFFF',
-        border: '1.5px solid #CBD5E1',
-        borderRadius: '6px',
-        fontSize: '0.8rem',
-        lineHeight: '1.6',
-        color: '#1E293B'
-      }}>
-        <div style={{ fontWeight: 800, color: '#0F172A', marginBottom: '0.4rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-          <span>Toán học Lượng tử hóa RDOQ tại QP={qp}:</span>
-          {sig_coeff_count === 0 && (
-            <span style={{ background: '#10B981', color: '#FFF', fontSize: '0.7rem', padding: '0.1rem 0.45rem', borderRadius: '3px', fontWeight: 700 }}>
-              CBF=0 Tối Ưu Nén Cực Đại
-            </span>
-          )}
+      {/* Selected Pixel Inspector Readout */}
+      {selectedCell && (
+        <div style={{
+          background: '#FFFBEB',
+          border: '2px solid #F59E0B',
+          padding: '0.65rem 1rem',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          gap: '0.75rem',
+          fontFamily: 'JetBrains Mono',
+          fontSize: '0.8rem'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.85rem', flexWrap: 'wrap' }}>
+            <strong style={{ color: '#B45309' }}>
+              Pixel ({selectedCell.x}, {selectedCell.y}):
+            </strong>
+            <span>Residual: <strong>{resi_matrix[selectedCell.y * width + selectedCell.x]}</strong></span>
+            <span>DCT/DST: <strong>{dct_coeff[selectedCell.y * width + selectedCell.x]}</strong></span>
+            <span>Quant: <strong style={{ color: 'var(--c-magenta)' }}>{quant_coeff[selectedCell.y * width + selectedCell.x]}</strong></span>
+          </div>
         </div>
-        <div>
-          • <strong>Công thức Lượng tử nguyên HEVC:</strong> <code>|Q| = floor((|Y| × 20560 + f) / 2¹⁹)</code> với hệ số nhân <code>g_quantScales[2] = 20560</code> (QP%6=2) và độ dịch bit <code>14 + 5 = 19</code>.
-        </div>
-        <div>
-          • <strong>Ngưỡng Vùng Chết (Dead-zone Threshold):</strong> Để một hệ số khác 0 (<code>|Q| ≥ 1</code>), độ lớn hệ số biến đổi phải đạt <code>|Y| ≥ (2¹⁹ - f) / 20560 ≈ 17.0</code>.
-        </div>
-        <div>
-          • <strong>Tối ưu hóa Chi phí R-D (RDOQ):</strong> Việc truyền dù chỉ 1 hệ số khác 0 bắt buộc bật cờ <code>cbf_luma = 1</code> và truyền chuỗi cú pháp CABAC tốn 15–25 bit (ΔJ_rate ≈ 350–500). Thuật toán RDOQ của HM chủ động làm tròn toàn bộ hệ số về 0 để đạt chi phí Lagrange J thấp nhất!
-        </div>
-      </div>
+      )}
     </div>
   );
 }

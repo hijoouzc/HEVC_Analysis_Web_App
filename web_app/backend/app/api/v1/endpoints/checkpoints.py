@@ -59,10 +59,13 @@ async def get_all_partitions(job_id: str):
 # CP_02_INTRA_REF Endpoints
 # ==========================================
 @router.get("/{job_id}/CP_02_INTRA_REF", response_model=IntraRefCheckpoint)
-async def get_intra_ref_checkpoint(job_id: str):
+async def get_intra_ref_checkpoint(
+    job_id: str,
+    cu_size: int | None = Query(None, description="Optional target CU block size (4, 8, 16, 32, 64)")
+):
     """CP_02_INTRA_REF: Retrieves raw and filtered reference samples (4N+1)"""
     try:
-        return analysis_service.get_intra_ref_data(job_id)
+        return analysis_service.get_intra_ref_data(job_id, cu_size=cu_size)
     except JobNotFoundError:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
     except Exception as e:
@@ -85,11 +88,12 @@ async def get_intra_search_summary(job_id: str):
 async def compare_intra_candidates(
     job_id: str,
     mode_a: int = Query(..., ge=0, le=34, description="First candidate mode index"),
-    mode_b: int = Query(..., ge=0, le=34, description="Second candidate mode index")
+    mode_b: int = Query(..., ge=0, le=34, description="Second candidate mode index"),
+    cu_size: int | None = Query(None, description="Optional CU block size (4, 8, 16, 32, 64)")
 ):
     """Computes pixel-by-pixel differential prediction and cost comparison between two Intra modes"""
     try:
-        return analysis_service.compare_intra_modes(job_id, mode_a=mode_a, mode_b=mode_b)
+        return analysis_service.compare_intra_modes(job_id, mode_a=mode_a, mode_b=mode_b, cu_size=cu_size)
     except JobNotFoundError:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
     except InvalidInputError as e:
@@ -100,11 +104,12 @@ async def compare_intra_candidates(
 @router.get("/{job_id}/CP_03_INTRA_SEARCH", response_model=list[IntraModeData])
 async def get_intra_search_modes(
     job_id: str,
-    mode: int | None = Query(None, ge=0, le=34, description="Optional filter for a specific mode index (0-34)")
+    mode: int | None = Query(None, ge=0, le=34, description="Optional filter for a specific mode index (0-34)"),
+    cu_size: int | None = Query(None, description="Optional target CU block size (4, 8, 16, 32, 64)")
 ):
     """Lazy-load full matrix and reference sample data for tested Intra modes"""
     try:
-        return analysis_service.get_intra_search_data(job_id, mode=mode)
+        return analysis_service.get_intra_search_data(job_id, mode=mode, cu_size=cu_size)
     except JobNotFoundError:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
     except Exception as e:
@@ -116,7 +121,7 @@ async def get_intra_search_modes(
 @router.get("/{job_id}/CP_06_TRANSFORM", response_model=list[TransformQuantCheckpoint])
 async def get_transform_checkpoints(
     job_id: str,
-    comp: str = Query("Y", description="Color component ('Y', 'Cb', 'Cr')"),
+    comp: str | None = Query(None, description="Color component ('Y', 'Cb', 'Cr')"),
     component: str | None = Query(None, description="Alias for comp")
 ):
     """CP_06_TRANSFORM: Retrieves 2D DCT/DST transform coefficients and residual matrix"""
@@ -131,7 +136,7 @@ async def get_transform_checkpoints(
 @router.get("/{job_id}/CP_07_QUANT", response_model=list[TransformQuantCheckpoint])
 async def get_quant_checkpoints(
     job_id: str,
-    comp: str = Query("Y", description="Color component ('Y', 'Cb', 'Cr')"),
+    comp: str | None = Query(None, description="Color component ('Y', 'Cb', 'Cr')"),
     component: str | None = Query(None, description="Alias for comp")
 ):
     """CP_07_QUANT: Retrieves quantized transform coefficients and sparsity statistics"""

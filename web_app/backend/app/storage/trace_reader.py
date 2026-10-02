@@ -23,9 +23,16 @@ class TraceReader:
                     continue
 
     @staticmethod
-    def read_all(trace_file: Path, event_filter: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+    def read_all(
+        trace_file: Path,
+        event_filter: str | None = None,
+        limit: int | None = None,
+        predicate: Callable[[dict[str, Any]], bool] | None = None
+    ) -> list[dict[str, Any]]:
         results = []
         for event in TraceReader.stream_events(trace_file, event_filter):
+            if predicate is not None and not predicate(event):
+                continue
             results.append(event)
             if limit is not None and len(results) >= limit:
                 break

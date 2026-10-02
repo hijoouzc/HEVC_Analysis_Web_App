@@ -48,7 +48,8 @@ dump_data/
 /build/
 /bin/
 /lib/
-core
+/core
+core.[0-9]*
 deploy/
 *.o
 *.a

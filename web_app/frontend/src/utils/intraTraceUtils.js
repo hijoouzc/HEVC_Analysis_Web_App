@@ -26,7 +26,10 @@ export const INV_ANGLES = {
  * @param {number[]} refLeft Reference samples left array
  * @returns {object} { refs: Array<{type: 'top'|'left', index: number, weight: number}>, text: string }
  */
-export function getPixelTrace(mode, x, y, blockSize, refTop = [], refLeft = []) {
+export function getPixelTrace(mode, x, y, blockSize = 8, rawRefTop = [], rawRefLeft = []) {
+  const refTop = Array.isArray(rawRefTop) ? rawRefTop : [];
+  const refLeft = Array.isArray(rawRefLeft) ? rawRefLeft : [];
+  blockSize = Math.max(4, Number(blockSize ?? 8));
   const pCorner = refTop[0] ?? (refLeft[0] ?? 128);
 
   // Mode 0: Planar (Bilinear interpolation from 4 boundary points)
@@ -53,7 +56,7 @@ export function getPixelTrace(mode, x, y, blockSize, refTop = [], refLeft = []) 
         { type: 'top', index: blockSize + 1, weight: wTopRight, isCorner: true },
         { type: 'left', index: blockSize + 1, weight: wBottomLeft, isCorner: true }
       ],
-      text: `Mode 0 (Planar): ((7-${x})×${valLeft} + ${x + 1}×${topRight} + (7-${y})×${valTop} + ${y + 1}×${bottomLeft} + 8) >> 4 = ${planarVal}`
+      text: `Mode 0 (Planar): ((${blockSize - 1}-${x})×${valLeft} + ${x + 1}×${topRight} + (${blockSize - 1}-${y})×${valTop} + ${y + 1}×${bottomLeft} + ${blockSize}) >> ${Math.log2(blockSize) + 1} = ${planarVal}`
     };
   }
 
@@ -107,7 +110,7 @@ export function getPixelTrace(mode, x, y, blockSize, refTop = [], refLeft = []) 
         { type: 'top', index: x + 1, weight: 0.5 },
         { type: 'left', index: y + 1, weight: 0.5 }
       ],
-      text: `Mode 1 (DC Mean): (${sumTop} + ${sumLeft} + 8) >> 4 = ${valDC}`
+      text: `Mode 1 (DC Mean): (${sumTop} + ${sumLeft} + ${blockSize}) >> ${Math.log2(blockSize) + 1} = ${valDC}`
     };
   }
 
@@ -255,32 +258,34 @@ export function getPixelTrace(mode, x, y, blockSize, refTop = [], refLeft = []) 
  * @returns {number} Delay in seconds (0.0 to 0.18s)
  */
 export function getWavefrontDelay(mode, x, y, blockSize = 8) {
+  const safeBs = Math.max(2, Number(blockSize ?? 8));
+  const denom = Math.max(1, safeBs - 1);
   let dist = 0;
   if (mode === 26) {
     // Pure vertical: top to bottom
-    dist = y / (blockSize - 1);
+    dist = y / denom;
   } else if (mode === 10) {
     // Pure horizontal: left to right
-    dist = x / (blockSize - 1);
+    dist = x / denom;
   } else if (mode >= 18 && mode <= 25) {
     // Negative vertical angles: top-left towards bottom-right
-    dist = (y * 1.4 + x * 0.6) / (blockSize * 2);
+    dist = (y * 1.4 + x * 0.6) / (safeBs * 2);
   } else if (mode >= 27 && mode <= 34) {
     // Positive vertical angles: top-right towards bottom-left
-    dist = (y * 1.4 + (blockSize - 1 - x) * 0.6) / (blockSize * 2);
+    dist = (y * 1.4 + (safeBs - 1 - x) * 0.6) / (safeBs * 2);
   } else if (mode >= 2 && mode <= 9) {
     // Positive horizontal angles: bottom-left towards top-right
-    dist = (x * 1.4 + (blockSize - 1 - y) * 0.6) / (blockSize * 2);
+    dist = (x * 1.4 + (safeBs - 1 - y) * 0.6) / (safeBs * 2);
   } else if (mode >= 11 && mode <= 17) {
     // Negative horizontal angles: top-left towards bottom-right
-    dist = (x * 1.4 + y * 0.6) / (blockSize * 2);
+    dist = (x * 1.4 + y * 0.6) / (safeBs * 2);
   } else if (mode === 0) {
     // Planar: radial sweep from top-left corner
-    dist = Math.sqrt(x * x + y * y) / (Math.SQRT2 * (blockSize - 1));
+    dist = Math.sqrt(x * x + y * y) / (Math.SQRT2 * denom);
   } else {
     // DC: expanding ripple from boundary inwards
-    dist = Math.min(x, y, blockSize - 1 - x, blockSize - 1 - y) / (blockSize / 2);
+    dist = Math.min(x, y, safeBs - 1 - x, safeBs - 1 - y) / (safeBs / 2);
   }
 
-  return Math.max(0, Math.min(0.2, dist * 0.18));
+  return Math.max(0, Math.min(0.2, (Number.isFinite(dist) ? dist : 0) * 0.18));
 }

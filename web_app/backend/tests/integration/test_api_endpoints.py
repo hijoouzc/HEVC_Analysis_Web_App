@@ -40,6 +40,10 @@ def test_legacy_upload_compatibility(client, dummy_png_bytes, sample_trace_file,
     assert json_data["ctu_y"] == 0
     assert "best_mode" in json_data
     assert "best_cost" in json_data
+    assert "ref_samples" in json_data
+    assert json_data["ref_samples"] is not None
+    assert "ref_unfilt_top" in json_data["ref_samples"]
+
 
 def test_modern_job_and_checkpoint_api(client, dummy_png_bytes, sample_trace_file, monkeypatch):
     mock_runner = MockEncoderRunner(fixture_path=sample_trace_file)
@@ -123,6 +127,12 @@ def test_modern_job_and_checkpoint_api(client, dummy_png_bytes, sample_trace_fil
     assert "energy_compaction_ratio" in tr_item
     assert tr_item["component"] == "Y"
 
+    # CP_06_TRANSFORM without component parameter returns all components
+    tr_all_res = client.get(f"/api/v1/checkpoints/{job_id}/CP_06_TRANSFORM")
+    assert tr_all_res.status_code == 200
+    assert len(tr_all_res.json()) >= len(tr_list)
+
+
     # 9. Check CP_07_QUANT
     q_res = client.get(f"/api/v1/checkpoints/{job_id}/CP_07_QUANT?component=Y")
     assert q_res.status_code == 200
@@ -132,4 +142,22 @@ def test_modern_job_and_checkpoint_api(client, dummy_png_bytes, sample_trace_fil
     assert len(q_item["quant_coeff"]) == 64
     assert "sparsity_ratio" in q_item
     assert q_item["sparsity_ratio"] >= 0.0
+
+    # 10. Check Image endpoints
+    orig_img_res = client.get(f"/api/v1/jobs/{job_id}/images/original")
+    assert orig_img_res.status_code == 200
+    assert orig_img_res.headers["content-type"] == "image/png"
+
+    recon_img_res = client.get(f"/api/v1/jobs/{job_id}/images/reconstructed")
+    assert recon_img_res.status_code == 200
+    assert recon_img_res.headers["content-type"] == "image/png"
+
+    y_plane_res = client.get(f"/api/v1/jobs/{job_id}/images/y")
+    assert y_plane_res.status_code == 200
+    assert y_plane_res.headers["content-type"] == "image/png"
+
+    res_img_res = client.get(f"/api/v1/jobs/{job_id}/images/residual")
+    assert res_img_res.status_code == 200
+    assert res_img_res.headers["content-type"] == "image/png"
+
 

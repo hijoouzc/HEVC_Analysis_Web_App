@@ -59,7 +59,7 @@ public:
                (m_currentPOC == m_targetPOC) && 
                (m_currentCtuX == m_targetCtuX) && 
                (m_currentCtuY == m_targetCtuY) &&
-               (cuSize == m_targetCuSize); 
+               (m_targetCuSize <= 0 || cuSize == m_targetCuSize); 
     }
 
     Void dumpIntraRefSamples(Int cuSize,

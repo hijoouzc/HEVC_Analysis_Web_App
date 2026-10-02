@@ -1,35 +1,57 @@
-import React, { useState, useMemo } from 'react';
-import { getIntraModeInfo } from '../utils/colorUtils';
+import React, { useState, useMemo, useCallback } from 'react';
+import { getIntraModeInfo, getSampleColorAndTextColor, getResidualColorAndTextColor, SELECTION_HIGHLIGHT_COLOR } from '../utils/colorUtils';
 
 /**
- * Synchronized4WayViewport (Cải tiến 2)
- * Synchronized 4-Way Viewport:
- * [1] Original: Pixel gốc của khối (Y)
- * [2] Prediction: Pixel dự đoán từ Intra mode
- * [3] Residual Heatmap: Bản đồ nhiệt phần dư (0 = Đen, + = Đỏ rực, - = Xanh lam)
- * [4] Reconstruction: Tái tạo (Pred + Resi clip [0..255])
+ * Synchronized4WayViewport
+ * Synchronized 4-Way Crosshair Viewport across:
+ * [1] Original: Reference block texture (Y / Cb / Cr)
+ * [2] Prediction: Model prediction from intra mode
+ * [3] Residual Heatmap: Signed error matrix (0 = Neutral, + = Red/Warm, - = Blue/Cool)
+ * [4] Reconstruction: Restored block (Clip3[0, 255, Pred + Resi])
  *
- * Full Crosshair synchronization across all 4 viewports on pixel hover.
+ * Fully dynamic block sizing (8×8, 16×16, 32×32) and channel selection (Y, Cb, Cr).
  */
 export default function Synchronized4WayViewport({
   modeData = null,
   currentMode = 0,
-  blockSize = 8,
+  _blockSize = 8,
   ctuX = 0,
   ctuY = 0,
   onBackToIntra = null
 }) {
-  const [hoveredPixel, setHoveredPixel] = useState(null); // { r, c }
+  const [channel, setChannel] = useState('Y'); // 'Y', 'U', 'V'
+  const [selectedPixel, setSelectedPixel] = useState({ r: 0, c: 0 }); // click-only inspection
   const [layoutMode, setLayoutMode] = useState('2x2'); // '2x2' or 'side-by-side'
   const [showValues, setShowValues] = useState(true);
-  const [zoomLevel, setZoomLevel] = useState(40); // 32px, 40px, 48px
+  const [zoomPreset, setZoomPreset] = useState('fit'); // 'fit', '1.5x', '2x'
 
-  const N = blockSize || 8;
+  const handleChannelChange = useCallback((newCh) => {
+    setChannel(newCh);
+    setSelectedPixel(null);
+  }, []);
+
+  // Target block size based on selected channel (ITU-T H.265 4:2:0 subsampling)
+  // Strictly enforce 8x8 for Luma and 4x4 for Chroma
+  const targetN = (channel === 'Y') ? 8 : 4;
+  const N = targetN;
   const totalPixels = N * N;
 
-  const orgData = modeData?.org_data || Array(totalPixels).fill(128);
-  const predData = modeData?.pred_data || Array(totalPixels).fill(128);
-  const resiData = modeData?.resi_data || Array(totalPixels).fill(0);
+  // Extract memoized raw arrays based on selected channel
+  const orgData = useMemo(() => {
+    const raw = channel === 'U' ? modeData?.org_u : channel === 'V' ? modeData?.org_v : modeData?.org_data;
+    return (raw && raw.length >= totalPixels) ? raw.slice(0, totalPixels) : Array(totalPixels).fill(128);
+  }, [channel, modeData, totalPixels]);
+
+  const predData = useMemo(() => {
+    const raw = channel === 'U' ? modeData?.pred_u : channel === 'V' ? modeData?.pred_v : modeData?.pred_data;
+    return (raw && raw.length >= totalPixels) ? raw.slice(0, totalPixels) : Array(totalPixels).fill(128);
+  }, [channel, modeData, totalPixels]);
+
+  const resiData = useMemo(() => {
+    const raw = channel === 'U' ? modeData?.resi_u : channel === 'V' ? modeData?.resi_v : modeData?.resi_data;
+    return (raw && raw.length >= totalPixels) ? raw.slice(0, totalPixels) : Array(totalPixels).fill(0);
+  }, [channel, modeData, totalPixels]);
+
   const activeMode = modeData?.mode ?? currentMode ?? 0;
   const modeInfo = getIntraModeInfo(activeMode);
 
@@ -64,45 +86,29 @@ export default function Synchronized4WayViewport({
     return { sad, sse, maxAbsResi, zeroCount, meanOrg, meanPred, psnr };
   }, [orgData, predData, resiData, totalPixels]);
 
-  // Dynamic max scale for residual heatmap (clipped to at least 16 for vibrant contrast)
+  // Dynamic cell sizing based on N to prevent viewport overflow
+  const cellSize = useMemo(() => {
+    let base = Math.max(9, Math.floor(320 / N));
+    if (zoomPreset === '1.5x') base = Math.round(base * 1.4);
+    if (zoomPreset === '2x') base = Math.round(base * 1.8);
+    return Math.max(8, base);
+  }, [N, zoomPreset]);
+
+  const showCellText = showValues && cellSize >= 15;
+
+  // Dynamic max scale for residual heatmap
   const heatmapScale = Math.max(16, stats.maxAbsResi);
 
   // Residual Heatmap color generator
   const getResidualStyle = (val) => {
-    if (val === 0) {
-      return {
-        bg: '#141414',
-        color: '#666666',
-        border: '1px solid rgba(255, 255, 255, 0.08)'
-      };
-    }
-
-    const ratio = Math.min(1, Math.abs(val) / heatmapScale);
-
-    if (val > 0) {
-      // Lệch dương (+): Đỏ rực (Red/Warm)
-      const r = Math.round(190 + 65 * ratio);
-      const g = Math.round(20 * (1 - ratio));
-      const b = Math.round(45 * (1 - ratio));
-      return {
-        bg: `rgba(${r}, ${g}, ${b}, ${0.4 + 0.6 * ratio})`,
-        color: '#FFFFFF',
-        border: `1px solid rgba(255, 70, 95, ${0.5 + 0.5 * ratio})`
-      };
-    } else {
-      // Lệch âm (-): Xanh lam (Blue/Cool)
-      const r = Math.round(0);
-      const g = Math.round(135 + 65 * ratio);
-      const b = Math.round(205 + 50 * ratio);
-      return {
-        bg: `rgba(${r}, ${g}, ${b}, ${0.4 + 0.6 * ratio})`,
-        color: '#FFFFFF',
-        border: `1px solid rgba(0, 180, 255, ${0.5 + 0.5 * ratio})`
-      };
-    }
+    return getResidualColorAndTextColor(val, heatmapScale);
   };
 
-  // Helper to render an individual 8x8 matrix grid
+  const getSampleStyle = (val) => {
+    return getSampleColorAndTextColor(val, channel);
+  };
+
+  // Helper to render an individual matrix grid
   const renderMatrix = (type, dataArray, title, subtitle, badgeColor) => {
     return (
       <div style={{
@@ -110,14 +116,15 @@ export default function Synchronized4WayViewport({
         border: '2px solid var(--c-black)',
         boxShadow: '3px 3px 0px rgba(0,0,0,0.08)',
         display: 'flex',
-        flexDirection: 'column'
+        flexDirection: 'column',
+        minWidth: `${N * cellSize + 32}px`
       }}>
         {/* Sub-card Header */}
         <div style={{
           display: 'flex',
           justifyContent: 'space-between',
           alignItems: 'center',
-          padding: '0.6rem 0.85rem',
+          padding: '0.45rem 0.75rem',
           borderBottom: '2px solid var(--c-black)',
           background: 'var(--c-light-gray)'
         }}>
@@ -128,20 +135,21 @@ export default function Synchronized4WayViewport({
               fontSize: '0.75rem',
               fontWeight: 800,
               padding: '0.2rem 0.5rem',
-              marginRight: '0.5rem',
               fontFamily: 'JetBrains Mono'
             }}>
               {title}
             </span>
           </div>
-          <span style={{
-            fontSize: '0.72rem',
-            color: '#444',
-            fontFamily: 'JetBrains Mono',
-            fontWeight: 600
-          }}>
-            {subtitle}
-          </span>
+          {subtitle && (
+            <span style={{
+              fontSize: '0.72rem',
+              color: '#444',
+              fontFamily: 'JetBrains Mono',
+              fontWeight: 600
+            }}>
+              {subtitle}
+            </span>
+          )}
         </div>
 
         {/* Matrix Grid Container */}
@@ -150,65 +158,82 @@ export default function Synchronized4WayViewport({
           display: 'flex',
           justifyContent: 'center',
           alignItems: 'center',
-          background: type === 'resi' ? '#0d0d0d' : '#222222',
+          background: '#F8FAFC',
+          border: '1px solid #CBD5E1',
           overflow: 'auto'
         }}>
           <div style={{
             display: 'grid',
-            gridTemplateColumns: `repeat(${N}, ${zoomLevel}px)`,
-            gridTemplateRows: `repeat(${N}, ${zoomLevel}px)`,
+            gridTemplateColumns: `repeat(${N}, ${cellSize}px)`,
+            gridTemplateRows: `repeat(${N}, ${cellSize}px)`,
             gap: '1px',
-            background: type === 'resi' ? '#222' : '#333',
+            background: '#CBD5E1',
             border: '2px solid var(--c-black)',
             position: 'relative'
           }}>
             {dataArray.map((val, idx) => {
               const c = idx % N;
               const r = Math.floor(idx / N);
-              const isHovered = hoveredPixel && hoveredPixel.r === r && hoveredPixel.c === c;
+              const validR = selectedPixel ? Math.min(Math.max(0, selectedPixel.r), N - 1) : null;
+              const validC = selectedPixel ? Math.min(Math.max(0, selectedPixel.c), N - 1) : null;
+              const isSelected = selectedPixel !== null && validR === r && validC === c;
 
               let cellBg = '';
               let cellColor = '';
               let cellBorder = 'none';
+              let cellShadow = 'none';
 
               if (type === 'resi') {
                 const resiStyle = getResidualStyle(val);
                 cellBg = resiStyle.bg;
                 cellColor = resiStyle.color;
                 cellBorder = resiStyle.border;
+                cellShadow = resiStyle.textShadow;
               } else {
-                // Grayscale [0..255]
-                cellBg = `rgb(${val}, ${val}, ${val})`;
-                cellColor = val < 128 ? '#FFFFFF' : '#000000';
+                const sStyle = getSampleStyle(val);
+                cellBg = sStyle.bg;
+                cellColor = sStyle.color;
+                cellBorder = sStyle.border;
+                cellShadow = sStyle.textShadow;
               }
 
               return (
                 <div
                   key={`cell-${type}-${r}-${c}`}
-                  onMouseEnter={() => setHoveredPixel({ r, c })}
-                  onMouseLeave={() => setHoveredPixel(null)}
+                  onClick={() => {
+                    setSelectedPixel(prev => {
+                      if (prev && prev.r === r && prev.c === c) {
+                        return null;
+                      }
+                      return { r, c };
+                    });
+                  }}
                   style={{
-                    width: `${zoomLevel}px`,
-                    height: `${zoomLevel}px`,
+                    width: `${cellSize}px`,
+                    height: `${cellSize}px`,
                     backgroundColor: cellBg,
                     color: cellColor,
+                    textShadow: cellShadow,
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    fontSize: zoomLevel >= 48 ? '0.78rem' : zoomLevel >= 40 ? '0.68rem' : '0.58rem',
+                    fontSize: cellSize >= 36 ? '0.74rem' : cellSize >= 22 ? '0.60rem' : '0.45rem',
                     fontFamily: 'JetBrains Mono',
                     fontWeight: 700,
-                    cursor: 'crosshair',
+                    cursor: 'pointer',
                     userSelect: 'none',
-                    border: isHovered ? '2px solid #FFD200' : cellBorder,
-                    boxShadow: isHovered ? '0 0 0 2px #000, 0 0 8px #FFD200' : 'none',
-                    transform: isHovered ? 'scale(1.12)' : 'none',
-                    zIndex: isHovered ? 20 : 1,
-                    transition: 'transform 0.08s ease, box-shadow 0.08s ease'
+                    border: isSelected ? `2px solid ${SELECTION_HIGHLIGHT_COLOR}` : cellBorder,
+                    boxShadow: 'none',
+                    transform: 'none',
+                    zIndex: isSelected ? 20 : 1,
+                    transition: 'none',
+                    overflow: 'hidden',
+                    whiteSpace: 'nowrap',
+                    boxSizing: 'border-box'
                   }}
                   title={`[${type.toUpperCase()}] Row ${r}, Col ${c} = ${val}`}
                 >
-                  {showValues && (
+                  {(showCellText || (isSelected && cellSize >= 12)) && (
                     <span>
                       {type === 'resi' && val > 0 ? `+${val}` : val}
                     </span>
@@ -222,10 +247,12 @@ export default function Synchronized4WayViewport({
     );
   };
 
-  const hoveredOrg = hoveredPixel ? orgData[hoveredPixel.r * N + hoveredPixel.c] : null;
-  const hoveredPred = hoveredPixel ? predData[hoveredPixel.r * N + hoveredPixel.c] : null;
-  const hoveredResi = hoveredPixel ? resiData[hoveredPixel.r * N + hoveredPixel.c] : null;
-  const hoveredRecon = hoveredPixel ? reconData[hoveredPixel.r * N + hoveredPixel.c] : null;
+  const activeR = selectedPixel ? Math.min(Math.max(0, selectedPixel.r), N - 1) : null;
+  const activeC = selectedPixel ? Math.min(Math.max(0, selectedPixel.c), N - 1) : null;
+  const activeOrg = selectedPixel ? orgData[activeR * N + activeC] : null;
+  const activePred = selectedPixel ? predData[activeR * N + activeC] : null;
+  const activeResi = selectedPixel ? resiData[activeR * N + activeC] : null;
+  const activeRecon = selectedPixel ? reconData[activeR * N + activeC] : null;
 
   return (
     <div className="synchronized-4way-card" style={{
@@ -247,26 +274,16 @@ export default function Synchronized4WayViewport({
         borderBottom: '2px solid var(--c-light-gray)'
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
-          <div style={{
-            background: 'var(--c-magenta)',
-            color: '#FFFFFF',
-            fontWeight: 800,
-            fontSize: '0.85rem',
-            padding: '0.3rem 0.65rem',
-            letterSpacing: '0.05em'
-          }}>
-            [MULTI-VIEWPORT]
-          </div>
-          <span style={{ fontWeight: 700, fontSize: '1.1rem' }}>
-            Synchronized 4-Way Analysis Viewport
+          <span style={{ fontWeight: 700, fontSize: '1.05rem' }}>
+            Synchronized 4-Way Viewport
           </span>
           <span style={{
-            fontSize: '0.82rem',
-            color: '#555',
+            fontSize: '0.8rem',
+            color: '#64748B',
             fontFamily: 'JetBrains Mono',
             fontWeight: 600
           }}>
-            CTU ({ctuX}, {ctuY}) • Mode {activeMode} ({modeInfo.name}) — {N}×{N} Block
+            CTU ({ctuX}, {ctuY}) • Mode {activeMode} • {channel} {N}×{N}
           </span>
         </div>
 
@@ -291,6 +308,58 @@ export default function Synchronized4WayViewport({
             </button>
           )}
 
+          {/* Channel Selector Toggle */}
+          <div style={{ display: 'flex', border: '1.5px solid var(--c-black)', background: '#F1F5F9', padding: '2px' }}>
+            <button
+              type="button"
+              onClick={() => handleChannelChange('Y')}
+              style={{
+                padding: '0.25rem 0.55rem',
+                fontSize: '0.72rem',
+                fontWeight: 800,
+                fontFamily: 'JetBrains Mono',
+                border: 'none',
+                background: channel === 'Y' ? 'var(--c-black)' : 'transparent',
+                color: channel === 'Y' ? '#FFFFFF' : 'var(--c-black)',
+                cursor: 'pointer'
+              }}
+            >
+              Y
+            </button>
+            <button
+              type="button"
+              onClick={() => handleChannelChange('U')}
+              style={{
+                padding: '0.25rem 0.55rem',
+                fontSize: '0.72rem',
+                fontWeight: 800,
+                fontFamily: 'JetBrains Mono',
+                border: 'none',
+                background: channel === 'U' ? '#0284C7' : 'transparent',
+                color: channel === 'U' ? '#FFFFFF' : '#0284C7',
+                cursor: 'pointer'
+              }}
+            >
+              Cb
+            </button>
+            <button
+              type="button"
+              onClick={() => handleChannelChange('V')}
+              style={{
+                padding: '0.25rem 0.55rem',
+                fontSize: '0.72rem',
+                fontWeight: 800,
+                fontFamily: 'JetBrains Mono',
+                border: 'none',
+                background: channel === 'V' ? '#E11D48' : 'transparent',
+                color: channel === 'V' ? '#FFFFFF' : '#E11D48',
+                cursor: 'pointer'
+              }}
+            >
+              Cr
+            </button>
+          </div>
+
           {/* Layout Toggle */}
           <button
             type="button"
@@ -306,7 +375,7 @@ export default function Synchronized4WayViewport({
             }}
             title="Toggle between 2×2 Grid and 4-Column Side-by-Side layout"
           >
-            LAYOUT: {layoutMode === '2x2' ? '2×2 GRID' : 'SIDE-BY-SIDE'}
+            {layoutMode === '2x2' ? '2×2' : '4-Column'}
           </button>
 
           {/* Show Numbers Toggle */}
@@ -325,144 +394,148 @@ export default function Synchronized4WayViewport({
             }}
             title="Toggle pixel numerical text overlay"
           >
-            VALUES: {showValues ? 'ON' : 'OFF'}
+            Values: {showValues ? 'On' : 'Off'}
           </button>
 
           {/* Zoom Buttons */}
           <div style={{ display: 'flex', border: '2px solid var(--c-black)' }}>
-            {[32, 40, 48].map((size) => (
+            {['fit', '1.5x', '2x'].map((mode) => (
               <button
-                key={size}
+                key={mode}
                 type="button"
-                onClick={() => setZoomLevel(size)}
+                onClick={() => setZoomPreset(mode)}
                 style={{
                   padding: '0.35rem 0.6rem',
                   fontSize: '0.72rem',
                   fontWeight: 700,
                   fontFamily: 'JetBrains Mono',
                   border: 'none',
-                  borderRight: size !== 48 ? '1px solid var(--c-black)' : 'none',
-                  background: zoomLevel === size ? 'var(--c-blue)' : 'var(--c-white)',
-                  color: zoomLevel === size ? '#FFFFFF' : '#000000',
+                  borderRight: mode !== '2x' ? '1px solid var(--c-black)' : 'none',
+                  background: zoomPreset === mode ? 'var(--c-blue)' : 'var(--c-white)',
+                  color: zoomPreset === mode ? '#FFFFFF' : '#000000',
                   cursor: 'pointer'
                 }}
               >
-                {size === 32 ? '1x' : size === 40 ? '1.5x' : '2x'}
+                {mode.toUpperCase()}
               </button>
             ))}
           </div>
         </div>
       </div>
 
-      {/* 4-Way Viewport Grid Container */}
+      {/* Selected Pixel Synchronized Readout Banner */}
       <div style={{
-        display: 'grid',
-        gridTemplateColumns: layoutMode === '2x2' ? 'repeat(2, minmax(0, 1fr))' : 'repeat(4, minmax(0, 1fr))',
-        gap: '1.25rem',
-        marginBottom: '1rem'
-      }}>
-        {/* Viewport 1: Original */}
-        {renderMatrix('org', orgData, '1. ORIGINAL', `Mean: ${stats.meanOrg}`, '#0284C7')}
-
-        {/* Viewport 2: Prediction */}
-        {renderMatrix('pred', predData, '2. PREDICTION', `Mean: ${stats.meanPred}`, '#0D9488')}
-
-        {/* Viewport 3: Residual Heatmap */}
-        {renderMatrix('resi', resiData, '3. RESIDUAL (HEATMAP)', `Range: -${stats.maxAbsResi} .. +${stats.maxAbsResi}`, '#DE006A')}
-
-        {/* Viewport 4: Reconstruction */}
-        {renderMatrix('recon', reconData, '4. RECONSTRUCTION', `PSNR: ${stats.psnr} dB`, '#16A34A')}
-      </div>
-
-      {/* Residual Heatmap Color Legend Bar */}
-      <div style={{
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        flexWrap: 'wrap',
-        gap: '0.5rem',
-        padding: '0.5rem 0.85rem',
-        background: '#181818',
-        color: '#FFFFFF',
-        fontFamily: 'JetBrains Mono',
-        fontSize: '0.75rem',
-        border: '1px solid #333',
-        marginBottom: '0.75rem'
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-          <strong style={{ color: '#00A3E0' }}>HEATMAP:</strong>
-          <span style={{ color: '#00A3FF' }}>[-] Negative (-{heatmapScale})</span>
-          <div style={{
-            width: '120px',
-            height: '10px',
-            background: 'linear-gradient(to right, rgb(0, 163, 255), #121212 50%, rgb(255, 30, 80))',
-            borderRadius: '2px',
-            border: '1px solid #444'
-          }} />
-          <span style={{ color: '#FF3366' }}>[+] Positive (+{heatmapScale})</span>
-          <span style={{ color: '#888', marginLeft: '0.5rem' }}>[0 = Perfect Match]</span>
-        </div>
-
-        <div style={{ color: '#AAA' }}>
-          Zero Residuals: <strong>{stats.zeroCount}/{totalPixels}</strong> ({(stats.zeroCount / totalPixels * 100).toFixed(1)}% exact match)
-        </div>
-      </div>
-
-      {/* Synchronized Hover Crosshair Bar */}
-      <div style={{
+        background: selectedPixel ? '#FFFBEB' : '#F8FAFC',
+        border: selectedPixel ? '2px solid #F59E0B' : '1px solid #E2E8F0',
+        padding: '0.65rem 1rem',
+        marginBottom: '1rem',
         display: 'flex',
         justifyContent: 'space-between',
         alignItems: 'center',
         flexWrap: 'wrap',
         gap: '0.75rem',
-        padding: '0.75rem 1rem',
-        background: hoveredPixel ? '#FFFBEB' : 'var(--c-light-gray)',
-        border: hoveredPixel ? '2px solid #F59E0B' : '1px solid var(--c-silver)',
         fontFamily: 'JetBrains Mono',
         fontSize: '0.82rem',
-        transition: 'all 0.1s ease'
+        transition: 'none'
       }}>
-        {hoveredPixel ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: '1.25rem', flexWrap: 'wrap' }}>
-            <div>
-              <span style={{ color: '#666' }}>TARGET PIXEL: </span>
-              <strong style={{ color: '#000', fontSize: '0.95rem' }}>
-                [Row {hoveredPixel.r}, Col {hoveredPixel.c}]
-              </strong>
-            </div>
-            <div>
-              <span style={{ color: '#0284C7' }}>ORIGINAL: </span>
-              <strong>{hoveredOrg}</strong>
-            </div>
-            <div>
-              <span style={{ color: '#0D9488' }}>PRED: </span>
-              <strong>{hoveredPred}</strong>
-            </div>
-            <div>
-              <span style={{ color: hoveredResi > 0 ? '#DE006A' : hoveredResi < 0 ? '#00A3E0' : '#666' }}>
-                RESIDUAL (Δ): 
-              </span>
-              <strong>{hoveredResi > 0 ? `+${hoveredResi}` : hoveredResi}</strong>
-            </div>
-            <div>
-              <span style={{ color: '#16A34A' }}>RECON: </span>
-              <strong>{hoveredRecon}</strong>
-            </div>
-            <div>
-              <span style={{ color: '#666' }}>ERROR: </span>
-              <strong>{hoveredOrg - hoveredRecon}</strong>
-            </div>
+        {selectedPixel ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+            <span style={{ fontWeight: 800, color: '#B45309' }}>
+              Pixel ({activeR}, {activeC}):
+            </span>
+            <span>Original: <strong>{activeOrg}</strong></span>
+            <span>Prediction: <strong style={{ color: 'var(--c-blue)' }}>{activePred}</strong></span>
+            <span>Residual: <strong style={{ color: activeResi > 0 ? '#E11D48' : activeResi < 0 ? '#0284C7' : '#475569' }}>
+              {activeResi > 0 ? `+${activeResi}` : activeResi}
+            </strong></span>
+            <span>Reconstructed: <strong style={{ color: '#16A34A' }}>{activeRecon}</strong></span>
           </div>
         ) : (
-          <div style={{ color: '#666', fontFamily: 'JetBrains Mono' }}>
-            [CROSSHAIR HOVER] Inspect synchronized pixel across all 4 viewports
+          <div style={{ color: '#64748B', fontSize: '0.78rem' }}>
+            Click any pixel to inspect synchronized values across all 4 views
           </div>
         )}
+      </div>
 
-        <div style={{ display: 'flex', gap: '1rem', color: '#444', fontSize: '0.78rem' }}>
-          <span>SAD: <strong>{stats.sad}</strong></span>
-          <span>SSE: <strong>{stats.sse}</strong></span>
-          <span>PSNR: <strong>{stats.psnr} dB</strong></span>
+      {/* Viewport Matrices Container */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: layoutMode === '2x2' ? 'repeat(auto-fit, minmax(320px, 1fr))' : `repeat(4, minmax(${N * cellSize + 40}px, 1fr))`,
+        gap: '1.25rem',
+        marginBottom: '1.25rem',
+        overflowX: 'auto'
+      }}>
+        {/* Viewport 1: Original */}
+        {renderMatrix(
+          'org',
+          orgData,
+          `Original (${channel})`,
+          '',
+          '#10B981'
+        )}
+
+        {/* Viewport 2: Prediction */}
+        {renderMatrix(
+          'pred',
+          predData,
+          `Prediction (${channel})`,
+          `Mode ${activeMode}: ${modeInfo.name}`,
+          '#0284C7'
+        )}
+
+        {/* Viewport 3: Residual Heatmap */}
+        {renderMatrix(
+          'resi',
+          resiData,
+          `Residual (${channel})`,
+          `±${heatmapScale}`,
+          '#E11D48'
+        )}
+
+        {/* Viewport 4: Reconstruction */}
+        {renderMatrix(
+          'recon',
+          reconData,
+          `Reconstructed (${channel})`,
+          '',
+          '#8B5CF6'
+        )}
+      </div>
+
+      {/* Block Statistics & Metric Summary Footer */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+        gap: '0.75rem',
+        padding: '0.85rem 1rem',
+        background: 'var(--c-light-gray)',
+        border: '1.5px solid var(--c-black)',
+        fontFamily: 'JetBrains Mono',
+        fontSize: '0.78rem'
+      }}>
+        <div>
+          <span style={{ color: '#666', display: 'block', fontSize: '0.68rem', textTransform: 'uppercase' }}>Dimension</span>
+          <strong>{channel} {N}×{N}</strong>
+        </div>
+        <div>
+          <span style={{ color: '#666', display: 'block', fontSize: '0.68rem', textTransform: 'uppercase' }}>SAD</span>
+          <strong style={{ color: 'var(--c-magenta)' }}>{stats.sad}</strong>
+        </div>
+        <div>
+          <span style={{ color: '#666', display: 'block', fontSize: '0.68rem', textTransform: 'uppercase' }}>SSE</span>
+          <strong style={{ color: 'var(--c-orange)' }}>{stats.sse}</strong>
+        </div>
+        <div>
+          <span style={{ color: '#666', display: 'block', fontSize: '0.68rem', textTransform: 'uppercase' }}>PSNR</span>
+          <strong style={{ color: '#10B981' }}>{stats.psnr} dB</strong>
+        </div>
+        <div>
+          <span style={{ color: '#666', display: 'block', fontSize: '0.68rem', textTransform: 'uppercase' }}>Max Residual</span>
+          <strong style={{ color: '#E11D48' }}>±{stats.maxAbsResi}</strong>
+        </div>
+        <div>
+          <span style={{ color: '#666', display: 'block', fontSize: '0.68rem', textTransform: 'uppercase' }}>Zero Residuals</span>
+          <strong>{stats.zeroCount} / {totalPixels}</strong>
         </div>
       </div>
     </div>

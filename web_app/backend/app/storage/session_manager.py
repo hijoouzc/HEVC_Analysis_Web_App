@@ -33,6 +33,12 @@ class SessionManager:
         
     def get_meta_path(self, job_id: str) -> Path:
         return self.get_session_dir(job_id) / "meta.json"
+
+    def get_recon_yuv_path(self, job_id: str) -> Path:
+        return self.get_session_dir(job_id) / "recon.yuv"
+
+    def get_recon_image_path(self, job_id: str) -> Path:
+        return self.get_session_dir(job_id) / "recon.png"
         
     def cleanup_session(self, job_id: str) -> None:
         session_dir = self.base_dir / job_id

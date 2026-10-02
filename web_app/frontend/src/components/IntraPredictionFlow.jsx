@@ -1,14 +1,18 @@
-import React, { useState } from 'react';
-import { INTRA_PRED_ANGLES, INV_ANGLES, getPixelTrace, getWavefrontDelay } from '../utils/intraTraceUtils';
-import { getIntraModeInfo } from '../utils/colorUtils';
+import React, { useState, useMemo, useCallback } from 'react';
+import { INTRA_PRED_ANGLES, INV_ANGLES, getPixelTrace } from '../utils/intraTraceUtils';
+import { getIntraModeInfo, getSampleColorAndTextColor, SELECTION_HIGHLIGHT_COLOR } from '../utils/colorUtils';
+import ReferencePerimeter from './flow/ReferencePerimeter';
+import StageDetailSection from './flow/StageDetailSection';
+import ResidualMatrix from './flow/ResidualMatrix';
 
 /**
- * Computes 3-tap lowpass filter [1, 2, 1] / 4 for 33 reference samples
- * Exactly matches TComPattern.cpp lines 235-260 for Luma N=8
+ * Computes 3-tap lowpass filter [1, 2, 1] / 4 for (2N + 1) reference samples
+ * Exactly matches TComPattern.cpp lines 235-260 for Luma block size N
  */
 const computeMdisSmoothedRef = (refTop, refLeft, N = 8) => {
-  if (!refTop || !refLeft || refTop.length < 17 || refLeft.length < 17) {
-    return { top: Array(17).fill(128), left: Array(17).fill(128) };
+  const reqLen = 2 * N + 1;
+  if (!refTop || !refLeft || refTop.length < reqLen || refLeft.length < reqLen) {
+    return { top: Array(reqLen).fill(128), left: Array(reqLen).fill(128) };
   }
   const smoothedTop = [...refTop];
   const smoothedLeft = [...refLeft];
@@ -37,888 +41,582 @@ const computeMdisSmoothedRef = (refTop, refLeft, N = 8) => {
   return { top: smoothedTop, left: smoothedLeft };
 };
 
+/**
+ * Computes ray start and end coordinates connected strictly to cell borders,
+ * ensuring the ray line never crosses the center and never obscures cell numbers.
+ */
+const getRayBorderEndpoints = (ref, activeCoord, stageGridCellSize) => {
+  if (!ref || !activeCoord || !stageGridCellSize || stageGridCellSize <= 0) {
+    return { x1: 0, y1: 0, x2: 0, y2: 0 };
+  }
+  const refIndex = Number.isFinite(ref.index) ? ref.index : 0;
+  const Xmin = stageGridCellSize * (activeCoord.x + 1);
+  const Xmax = stageGridCellSize * (activeCoord.x + 2);
+  const Ymin = stageGridCellSize * (activeCoord.y + 1);
+  const Ymax = stageGridCellSize * (activeCoord.y + 2);
+  const Xmid = (Xmin + Xmax) / 2;
+  const Ymid = (Ymin + Ymax) / 2;
+
+  let x1, y1;
+  if (ref.type === 'top') {
+    // Start at bottom border of top reference cell (row 0)
+    x1 = stageGridCellSize * refIndex + stageGridCellSize / 2;
+    y1 = stageGridCellSize;
+  } else {
+    // Start at right border of left reference cell (column 0)
+    x1 = stageGridCellSize;
+    y1 = stageGridCellSize * refIndex + stageGridCellSize / 2;
+  }
+
+  const dx = Xmid - x1;
+  const dy = Ymid - y1;
+
+  let x2 = Xmid;
+  let y2 = Ymid;
+
+  const candidates = [];
+
+  if (Math.abs(dy) > 1e-4) {
+    // Top border Ymin
+    const tTop = (Ymin - y1) / dy;
+    if (tTop >= -1e-4 && tTop <= 1.01) {
+      const xAtTop = x1 + tTop * dx;
+      if (xAtTop >= Xmin - 0.5 && xAtTop <= Xmax + 0.5) {
+        candidates.push({ t: Math.max(0, tTop), x: Math.max(Xmin, Math.min(Xmax, xAtTop)), y: Ymin });
+      }
+    }
+    // Bottom border Ymax
+    const tBottom = (Ymax - y1) / dy;
+    if (tBottom >= -1e-4 && tBottom <= 1.01) {
+      const xAtBottom = x1 + tBottom * dx;
+      if (xAtBottom >= Xmin - 0.5 && xAtBottom <= Xmax + 0.5) {
+        candidates.push({ t: Math.max(0, tBottom), x: Math.max(Xmin, Math.min(Xmax, xAtBottom)), y: Ymax });
+      }
+    }
+  }
+
+  if (Math.abs(dx) > 1e-4) {
+    // Left border Xmin
+    const tLeft = (Xmin - x1) / dx;
+    if (tLeft >= -1e-4 && tLeft <= 1.01) {
+      const yAtLeft = y1 + tLeft * dy;
+      if (yAtLeft >= Ymin - 0.5 && yAtLeft <= Ymax + 0.5) {
+        candidates.push({ t: Math.max(0, tLeft), x: Xmin, y: Math.max(Ymin, Math.min(Ymax, yAtLeft)) });
+      }
+    }
+    // Right border Xmax
+    const tRight = (Xmax - x1) / dx;
+    if (tRight >= -1e-4 && tRight <= 1.01) {
+      const yAtRight = y1 + tRight * dy;
+      if (yAtRight >= Ymin - 0.5 && yAtRight <= Ymax + 0.5) {
+        candidates.push({ t: Math.max(0, tRight), x: Xmax, y: Math.max(Ymin, Math.min(Ymax, yAtRight)) });
+      }
+    }
+  }
+
+  if (candidates.length > 0) {
+    candidates.sort((a, b) => a.t - b.t);
+    x2 = candidates[0].x;
+    y2 = candidates[0].y;
+  }
+
+  return { x1, y1, x2, y2 };
+};
+
 const IntraPredictionFlow = ({
   modeData = null,
   refSamples = null,
   currentMode = 0,
   blockSize = 8,
   imagePreview = null,
-  imageDims = { width: 640, height: 360 },
+  _imageDims = { width: 640, height: 360 },
   ctuX = 0,
   ctuY = 0,
-  hoveredCoord = null,
+  _hoveredCoord = null,
   onHoverCoord = null,
-  onSelectMode = null,
   onBackToQuadTree = null,
   onGoTo4Way = null
 }) => {
+  const [channel, setChannel] = useState('Y'); // 'Y' (Luma), 'U' (Chroma Cb), 'V' (Chroma Cr)
+  const [zoomLevel, setZoomLevel] = useState('fit'); // 'fit' or 'zoom'
   const [activeTab, setActiveTab] = useState('all'); // 'all', 'step1', 'step2', 'step3', 'step4'
-  const [internalMode, setInternalMode] = useState(null);
-  const [displayModeStage1, setDisplayModeStage1] = useState('both'); // 'both', 'values', 'texture'
 
-  const selectedMode = (modeData && modeData.mode !== undefined)
-    ? modeData.mode
-    : (internalMode ?? currentMode);
-
+  const selectedMode = (modeData && modeData.mode !== undefined) ? modeData.mode : currentMode;
   const modeInfo = getIntraModeInfo(selectedMode);
-  const N = blockSize; // 8 for luma
+
+  // Target block size: strictly 8x8 for Luma, 4x4 for Chroma (ITU-T H.265 4:2:0 subsampling)
+  const targetN = (channel === 'Y') ? 8 : 4;
+
+  // Extract raw arrays based on channel
+  let rawOrg = null;
+  let rawPred = null;
+  let rawResi = null;
+  let rawRefTop = null;
+  let rawRefLeft = null;
+  let gtRefTopFilt = null;
+  let gtRefLeftFilt = null;
+
+  if (channel === 'U') {
+    rawOrg = modeData?.org_u;
+    rawPred = modeData?.pred_u;
+    rawResi = modeData?.resi_u;
+    rawRefTop = modeData?.ref_top_u || refSamples?.ref_unfilt_top_u;
+    rawRefLeft = modeData?.ref_left_u || refSamples?.ref_unfilt_left_u;
+    gtRefTopFilt = refSamples?.ref_filt_top_u;
+    gtRefLeftFilt = refSamples?.ref_filt_left_u;
+  } else if (channel === 'V') {
+    rawOrg = modeData?.org_v;
+    rawPred = modeData?.pred_v;
+    rawResi = modeData?.resi_v;
+    rawRefTop = modeData?.ref_top_v || refSamples?.ref_unfilt_top_v;
+    rawRefLeft = modeData?.ref_left_v || refSamples?.ref_unfilt_left_v;
+    gtRefTopFilt = refSamples?.ref_filt_top_v;
+    gtRefLeftFilt = refSamples?.ref_filt_left_v;
+  } else {
+    rawOrg = modeData?.org_data;
+    rawPred = modeData?.pred_data;
+    rawResi = modeData?.resi_data;
+    rawRefTop = modeData?.ref_top || refSamples?.ref_unfilt_top;
+    rawRefLeft = modeData?.ref_left || refSamples?.ref_unfilt_left;
+    gtRefTopFilt = modeData?.ref_filt_top || refSamples?.ref_filt_top;
+    gtRefLeftFilt = modeData?.ref_filt_left || refSamples?.ref_filt_left;
+  }
+
+  // Strictly enforce 8x8 for Luma and 4x4 for Chroma in Intra Pipeline to prevent overflow
+  const N = targetN;
+  const totalPixels = N * N;
+  const refSpan = 2 * N + 1;
+
+  const orgData = useMemo(() => (rawOrg && rawOrg.length >= totalPixels) ? rawOrg.slice(0, totalPixels) : Array(totalPixels).fill(128), [rawOrg, totalPixels]);
+  const predData = useMemo(() => (rawPred && rawPred.length >= totalPixels) ? rawPred.slice(0, totalPixels) : Array(totalPixels).fill(128), [rawPred, totalPixels]);
+  const resiData = useMemo(() => (rawResi && rawResi.length >= totalPixels) ? rawResi.slice(0, totalPixels) : Array(totalPixels).fill(0), [rawResi, totalPixels]);
+  const refTopRaw = useMemo(() => (rawRefTop && rawRefTop.length >= refSpan) ? rawRefTop.slice(0, refSpan) : Array(refSpan).fill(128), [rawRefTop, refSpan]);
+  const refLeftRaw = useMemo(() => (rawRefLeft && rawRefLeft.length >= refSpan) ? rawRefLeft.slice(0, refSpan) : Array(refSpan).fill(128), [rawRefLeft, refSpan]);
+
   const angle = INTRA_PRED_ANGLES[selectedMode] ?? 0;
   const invAngle = INV_ANGLES[angle] ?? 0;
-  const hasEdgeFilter = (selectedMode === 1 || selectedMode === 10 || selectedMode === 26) && N <= 16;
-  
-  // MDIS check: prioritize ground-truth flag from HM encoder, fall back to N=8 heuristics
-  const isMDISSmoothed = (modeData && modeData.b_use_filter !== undefined)
-    ? modeData.b_use_filter
-    : ((selectedMode === 0 || selectedMode === 2 || selectedMode === 18 || selectedMode === 34) && N === 8);
+  const hasEdgeFilter = (channel === 'Y') && (selectedMode === 1 || selectedMode === 10 || selectedMode === 26) && N <= 16;
 
-  // Image dimension calculations
-  const origW = imageDims?.width || 640;
-  const origH = imageDims?.height || 360;
-
-  // Extract reference and data arrays from modeData if available
-  const hasLiveData = modeData && modeData.org_data && modeData.pred_data && modeData.resi_data;
-  const orgData = hasLiveData ? modeData.org_data : Array(64).fill(128);
-  const predData = hasLiveData ? modeData.pred_data : Array(64).fill(128);
-  const resiData = hasLiveData ? modeData.resi_data : Array(64).fill(0);
-  const refTopRaw = (hasLiveData && modeData.ref_top) ? modeData.ref_top : Array(17).fill(128);
-  const refLeftRaw = (hasLiveData && modeData.ref_left) ? modeData.ref_left : Array(17).fill(128);
+  // MDIS check: Luma only, HEVC bypasses MDIS for Chroma
+  const isMDISSmoothed = (channel === 'Y') && (
+    (modeData && modeData.b_use_filter !== undefined)
+      ? modeData.b_use_filter
+      : ((selectedMode === 0 || selectedMode === 2 || selectedMode === 18 || selectedMode === 34) && N >= 8)
+  );
 
   // Compute or extract smoothed reference samples for Stage 02
-  const hasGroundTruthFiltered = refSamples && refSamples.ref_filt_top && refSamples.ref_filt_top.length >= 17;
-  const { top: simulatedTopFilt, left: simulatedLeftFilt } = computeMdisSmoothedRef(refTopRaw, refLeftRaw, N);
-  const refTopFilt = hasGroundTruthFiltered ? refSamples.ref_filt_top : simulatedTopFilt;
-  const refLeftFilt = hasGroundTruthFiltered ? refSamples.ref_filt_left : simulatedLeftFilt;
-  const refTopActive = isMDISSmoothed ? refTopFilt : refTopRaw;
-  const refLeftActive = isMDISSmoothed ? refLeftFilt : refLeftRaw;
+  const simulatedRefs = useMemo(() => computeMdisSmoothedRef(refTopRaw, refLeftRaw, N), [refTopRaw, refLeftRaw, N]);
+  const hasGroundTruthFiltered = gtRefTopFilt && gtRefTopFilt.length >= refSpan;
+  const refTopFilt = hasGroundTruthFiltered ? gtRefTopFilt : simulatedRefs.top;
+  const refLeftFilt = (gtRefLeftFilt && gtRefLeftFilt.length >= refSpan) ? gtRefLeftFilt : simulatedRefs.left;
+  const refTopActive = useMemo(() => isMDISSmoothed ? refTopFilt : refTopRaw, [isMDISSmoothed, refTopFilt, refTopRaw]);
+  const refLeftActive = useMemo(() => isMDISSmoothed ? refLeftFilt : refLeftRaw, [isMDISSmoothed, refLeftFilt, refLeftRaw]);
 
-  // Active hover and trace
-  const activeHover = hoveredCoord;
-  const trace = activeHover ? getPixelTrace(selectedMode, activeHover.x, activeHover.y, 8, refTopActive, refLeftActive) : null;
-  const activeTopIndices = new Set(trace ? trace.refs.filter(r => r.type === 'top').map(r => r.index) : []);
-  const activeLeftIndices = new Set(trace ? trace.refs.filter(r => r.type === 'left').map(r => r.index) : []);
+  // Active selected pixel and trace (Click-only selection, zero hover flutter)
+  const [selectedCoord, setSelectedCoord] = useState({ x: 0, y: 0, val: orgData[0] });
+  const activeCoord = (selectedCoord && selectedCoord.x < N && selectedCoord.y < N) ? selectedCoord : null;
 
-  const handleCellHover = (coord) => {
-    if (onHoverCoord) onHoverCoord(coord);
-  };
+  const trace = useMemo(() => {
+    if (!activeCoord) return null;
+    return getPixelTrace(selectedMode, activeCoord.x, activeCoord.y, N, refTopActive, refLeftActive);
+  }, [activeCoord, selectedMode, N, refTopActive, refLeftActive]);
 
-  const getRefStyle = (val, isActive, isCorner = false, isExtended = false) => ({
-    backgroundColor: `rgb(${val}, ${val}, ${val})`,
-    color: val < 128 ? '#FFFFFF' : '#000000',
-    textShadow: val < 128 ? '0 1px 2px rgba(0,0,0,0.8)' : '0 1px 2px rgba(255,255,255,0.8)',
-    border: isActive 
-      ? '2.5px solid #2563EB' 
-      : (isCorner ? '2px solid #EA580C' : (isExtended ? '1px dashed #94A3B8' : '1.5px solid #64748B')),
-    boxShadow: isActive ? '0 0 0 2px rgba(37, 99, 235, 0.4)' : 'none',
-    transform: isActive ? 'scale(1.14)' : 'none',
-    zIndex: isActive ? 15 : 2,
-    transition: 'all 0.1s ease',
-    fontSize: '0.58rem',
-    fontWeight: 700,
-    letterSpacing: '-0.5px',
-    lineHeight: 1,
-    overflow: 'hidden',
-    whiteSpace: 'nowrap',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    boxSizing: 'border-box'
-  });
+  const activeTopIndices = useMemo(() => {
+    if (!trace) return new Set();
+    return new Set(trace.refs.filter(r => r.type === 'top').map(r => r.index));
+  }, [trace]);
+
+  const activeLeftIndices = useMemo(() => {
+    if (!trace) return new Set();
+    return new Set(trace.refs.filter(r => r.type === 'left').map(r => r.index));
+  }, [trace]);
+
+  const handleCellClick = useCallback((coord) => {
+    setSelectedCoord(prev => {
+      if (prev && prev.x === coord.x && prev.y === coord.y) {
+        if (onHoverCoord) onHoverCoord(null);
+        return null;
+      }
+      if (onHoverCoord) onHoverCoord(coord);
+      return coord;
+    });
+  }, [onHoverCoord]);
+
+  const handleChannelChange = useCallback((newCh) => {
+    setChannel(newCh);
+    setSelectedCoord(null);
+    if (onHoverCoord) onHoverCoord(null);
+  }, [onHoverCoord]);
+
+  const getSampleColor = useCallback((val) => {
+    return getSampleColorAndTextColor(val, channel);
+  }, [channel]);
+
+  const S = 2 * N + 1;
+  const stageGridCellSize = zoomLevel === 'zoom'
+    ? Math.max(7, Math.floor(460 / S))
+    : Math.max(4, Math.floor(300 / S));
+  const stageGridSize = stageGridCellSize * S;
+  const showCellText = stageGridCellSize >= 13;
+
+  const resiCellSize = Math.max(4, Math.floor((stageGridSize - 50) / N));
+  const showResiText = resiCellSize >= 13;
+
+  const getRefStyle = useCallback((val, isActive, isCorner = false, isExtended = false) => {
+    const { bg, color } = getSampleColor(val);
+    return {
+      backgroundColor: bg,
+      color: color,
+      border: isActive 
+        ? `2px solid ${SELECTION_HIGHLIGHT_COLOR}` 
+        : (isCorner ? '1.5px solid #0F172A' : (isExtended ? '1px dashed #94A3B8' : '1px solid #64748B')),
+      boxShadow: 'none',
+      transform: 'none',
+      zIndex: isActive ? 15 : 2,
+      transition: 'none',
+      fontSize: stageGridCellSize >= 20 ? '0.62rem' : stageGridCellSize >= 15 ? '0.50rem' : '0.40rem',
+      fontWeight: 700,
+      letterSpacing: '-0.5px',
+      lineHeight: 1,
+      overflow: 'hidden',
+      whiteSpace: 'nowrap',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      boxSizing: 'border-box'
+    };
+  }, [getSampleColor, stageGridCellSize]);
 
   return (
     <div className="flow-container">
-      {/* Drill-Down Navigation Bar */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+      {/* 1. COMPACT ENGINEERING TOOLBAR (Replaces old multi-layer headers) */}
+      <div className="flow-toolbar">
+        <div className="flow-toolbar-left">
           {onBackToQuadTree && (
             <button
               type="button"
               onClick={onBackToQuadTree}
-              style={{
-                padding: '0.35rem 0.75rem',
-                fontSize: '0.75rem',
-                fontWeight: 700,
-                fontFamily: 'JetBrains Mono',
-                border: '1.5px solid var(--c-black)',
-                background: 'var(--c-white)',
-                cursor: 'pointer'
-              }}
+              className="flow-back-btn"
               title="Return to QuadTree CTU layout"
             >
-              ← BACK TO QUADTREE CTU ({ctuX}, {ctuY})
+              ← CTU ({ctuX}, {ctuY})
             </button>
           )}
-          <span style={{ fontSize: '0.85rem', fontWeight: 800, fontFamily: 'JetBrains Mono' }}>
-            [LEVEL 3: INTRA PREDICTION PIPELINE]
-          </span>
+          <div className="flow-status-chip">
+            <span className="chip-cu">CU {blockSize}×{blockSize} ({channel === 'Y' ? 'Luma' : channel === 'U' ? 'Cb' : 'Cr'})</span>
+            <span className="chip-sep">•</span>
+            <span className="chip-mode">Mode {selectedMode}: {modeInfo.name}</span>
+          </div>
         </div>
 
-        {onGoTo4Way && (
+        <div className="flow-toolbar-right">
+          {/* Channel Selector Toggle */}
+          <div className="channel-segmented-group">
+            <button
+              type="button"
+              className={`channel-pill-btn ${channel === 'Y' ? 'active-y' : ''}`}
+              onClick={() => handleChannelChange('Y')}
+              title="Luma Y Channel"
+            >
+              <span className="channel-dot y-dot" /> Y (Luma)
+            </button>
+            <button
+              type="button"
+              className={`channel-pill-btn ${channel === 'U' ? 'active-u' : ''}`}
+              onClick={() => handleChannelChange('U')}
+              title="Chroma Cb Channel (Blue-Difference)"
+            >
+              <span className="channel-dot u-dot" /> Cb
+            </button>
+            <button
+              type="button"
+              className={`channel-pill-btn ${channel === 'V' ? 'active-v' : ''}`}
+              onClick={() => handleChannelChange('V')}
+              title="Chroma Cr Channel (Red-Difference)"
+            >
+              <span className="channel-dot v-dot" /> Cr
+            </button>
+          </div>
+
+          {/* Zoom Toggle */}
           <button
             type="button"
-            onClick={onGoTo4Way}
-            style={{
-              padding: '0.35rem 0.75rem',
-              fontSize: '0.75rem',
-              fontWeight: 700,
-              fontFamily: 'JetBrains Mono',
-              border: '1.5px solid var(--c-black)',
-              background: 'var(--c-white)',
-              cursor: 'pointer'
-            }}
-            title="Inspect with Synchronized 4-Way Crosshair Viewport"
+            onClick={() => setZoomLevel(prev => prev === 'fit' ? 'zoom' : 'fit')}
+            className="flow-action-btn"
+            title="Toggle between fit-to-card and enlarged zoom mode"
           >
-            4-WAY VIEWPORT →
+            {zoomLevel === 'zoom' ? 'ZOOM: 1.5×' : 'FIT'}
           </button>
-        )}
-      </div>
 
-      {/* Top Header */}
-      <div className="flow-header">
-        <div>
-          <h2 className="flow-title">HEVC Intra Prediction Explicit Data Pipeline</h2>
-          <p className="flow-subtitle">
-            Direct End-to-End Pixel Transformation: Original CU [8×8] → Reference Sampling → MDIS Filter → Sample Prediction → Residual Matrix
-          </p>
-        </div>
-
-        <div className="flow-mode-badge-wrap">
-          <div className="flow-active-badge">
-            <span style={{ fontSize: '0.72rem', color: '#666', textTransform: 'uppercase' }}>Active Evaluation</span>
-            <strong>Mode {selectedMode}: {modeInfo.name} ({modeInfo.type})</strong>
-            <span style={{ fontSize: '0.72rem', fontFamily: 'JetBrains Mono' }}>
-              Angle: {angle} | MDIS: {isMDISSmoothed ? '3-Tap Filtered' : 'Direct'} | Edge Filter: {hasEdgeFilter ? 'Enabled' : 'Bypass'}
-            </span>
-          </div>
-          {onSelectMode && (
-            <select 
-              value={selectedMode} 
-              onChange={(e) => {
-                const m = Number(e.target.value);
-                setInternalMode(m);
-                onSelectMode(m);
-              }}
-              className="flow-mode-dropdown"
-              title="Inspect intra mode in live pipeline"
+          {onGoTo4Way && (
+            <button
+              type="button"
+              onClick={onGoTo4Way}
+              className="flow-action-btn primary"
+              title="Inspect with Synchronized 4-Way Crosshair Viewport"
             >
-              {Array.from({ length: 35 }, (_, i) => {
-                const info = getIntraModeInfo(i);
-                return (
-                  <option key={i} value={i}>
-                    Mode {i}: {info.name} ({info.type})
-                  </option>
-                );
-              })}
-            </select>
+              4-WAY VIEW →
+            </button>
           )}
         </div>
       </div>
 
-      {/* TOP SECTION: User Mockup Layout: [INPUT: Original CU (8x8)] ---> [SEQUENTIAL PIPELINE] ---> [OUTPUT: Prediction CU (8x8)] */}
-      <div className="live-top-flow-banner">
-        {/* Left: INPUT Original CU (8x8) from uploaded image */}
-        <div className="live-cu-card">
-          <span className="live-card-badge" style={{ background: 'var(--c-magenta)' }}>INPUT: ORIGINAL CU (8×8)</span>
-          <div className="live-cu-viewport" style={{ borderColor: 'var(--c-magenta)' }}>
-            {imagePreview ? (
-              <img 
-                src={imagePreview} 
-                alt="CU 8x8 Original"
-                style={{ 
-                  width: `${origW}px`, 
-                  height: `${origH}px`, 
-                  transformOrigin: '0 0',
-                  transform: `scale(22) translate(-${ctuX * 64}px, -${ctuY * 64}px)` 
-                }} 
-              />
-            ) : (
-              <div className="empty-viewport-text">No Image</div>
-            )}
-          </div>
-          <div className="live-cu-meta">
-            Target CTU [{ctuX}, {ctuY}] Offset ({ctuX * 64}, {ctuY * 64})
-          </div>
-        </div>
-
-        {/* Arrow to Pipeline */}
-        <div className="live-flow-arrow">→</div>
-
-        {/* Center: SEQUENTIAL PIPELINE DATA FLOW */}
-        <div className="live-pipeline-chain-box">
-          <div className="live-pipeline-title">SEQUENTIAL PIPELINE DATA FLOW</div>
-          <div className="live-chain-steps">
-            <div className={`live-chain-step ${activeTab === 'step1' ? 'active-step' : ''}`} onClick={() => setActiveTab('step1')}>
-              <span className="step-label">STAGE 01</span>
-              <strong className="step-name">Reference Sample Prep</strong>
-              <span className="step-desc">Neighbouring Reco Pixels</span>
-              <span className="step-io">Input: Frame Buffer → Output: 4N+1 (33)</span>
-            </div>
-
-            <span className="step-link-arrow">→</span>
-
-            <div className={`live-chain-step ${activeTab === 'step2' ? 'active-step' : ''}`} onClick={() => setActiveTab('step2')}>
-              <span className="step-label">STAGE 02</span>
-              <strong className="step-name">Substitution & MDIS</strong>
-              <span className="step-desc">Hole Fill & 3-Tap Smoothing</span>
-              <span className="step-io">Input: 4N+1 Raw → Output: 4N+1 Clean</span>
-            </div>
-
-            <span className="step-link-arrow">→</span>
-
-            <div className={`live-chain-step ${activeTab === 'step3' ? 'active-step' : ''}`} onClick={() => setActiveTab('step3')}>
-              <span className="step-label">STAGE 03</span>
-              <strong className="step-name">Sample Prediction</strong>
-              <span className="step-desc">Planar / DC / 33 Directional Angles</span>
-              <span className="step-io">Input: 4N+1 Clean → Output: N×N Matrix</span>
-            </div>
-
-            <span className="step-link-arrow">→</span>
-
-            <div className={`live-chain-step ${activeTab === 'step4' ? 'active-step' : ''}`} onClick={() => setActiveTab('step4')}>
-              <span className="step-label">STAGE 04</span>
-              <strong className="step-name">Boundary Filtering</strong>
-              <span className="step-desc">Edge Artifact Suppression (Luma)</span>
-              <span className="step-io">Input: N×N Matrix → Output: Final Pred (8×8)</span>
-            </div>
-          </div>
-        </div>
-
-        {/* Arrow to Output */}
-        <div className="live-flow-arrow">→</div>
-
-        {/* Right: OUTPUT Prediction CU (8x8) generated by the pipeline */}
-        <div className="live-cu-card">
-          <span className="live-card-badge" style={{ background: 'var(--c-blue)' }}>OUTPUT: PREDICTION (8×8)</span>
-          <div className="live-cu-viewport" style={{ borderColor: 'var(--c-blue)' }}>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 18px)', gridTemplateRows: 'repeat(8, 18px)' }}>
-              {predData.map((val, idx) => (
-                <div 
-                  key={`out-pred-cell-${idx}`}
-                  style={{
-                    backgroundColor: `rgb(${val}, ${val}, ${val})`,
-                    color: val < 128 ? '#FFF' : '#000',
-                    fontSize: '0.45rem',
-                    fontWeight: 700,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontFamily: 'JetBrains Mono',
-                    lineHeight: 1,
-                    overflow: 'hidden',
-                    whiteSpace: 'nowrap'
-                  }}
-                >
-                  {val}
-                </div>
-              ))}
-            </div>
-          </div>
-          <div className="live-cu-meta">
-            Mode {selectedMode}: {modeInfo.name} Block
-          </div>
-        </div>
-      </div>
-
-      {/* Stage Navigation Tabs */}
-      <div className="flow-nav-tabs">
-        <button 
-          className={`flow-tab-btn ${activeTab === 'all' ? 'active' : ''}`}
+      {/* 2. STAGE STEPPER NAVIGATION */}
+      <div className="pipeline-stepper-bar">
+        <button
+          type="button"
+          className={`stepper-pill ${activeTab === 'all' ? 'active' : ''}`}
           onClick={() => setActiveTab('all')}
         >
-          All Stages (Live Grid Overview)
+          <span className="stepper-idx">Overview</span>
         </button>
-        <button 
-          className={`flow-tab-btn ${activeTab === 'step1' ? 'active' : ''}`}
+
+        <span className="stepper-arrow">→</span>
+
+        <button
+          type="button"
+          className={`stepper-pill ${activeTab === 'step1' ? 'active' : ''}`}
           onClick={() => setActiveTab('step1')}
         >
-          Stage 01 Detail: Reference Prep
+          <span className="stepper-idx">Stage 01</span>
         </button>
-        <button 
-          className={`flow-tab-btn ${activeTab === 'step2' ? 'active' : ''}`}
+
+        <span className="stepper-arrow">→</span>
+
+        <button
+          type="button"
+          className={`stepper-pill ${activeTab === 'step2' ? 'active' : ''}`}
           onClick={() => setActiveTab('step2')}
         >
-          Stage 02 Detail: Substitution & MDIS
+          <span className="stepper-idx">Stage 02</span>
         </button>
-        <button 
-          className={`flow-tab-btn ${activeTab === 'step3' ? 'active' : ''}`}
+
+        <span className="stepper-arrow">→</span>
+
+        <button
+          type="button"
+          className={`stepper-pill ${activeTab === 'step3' ? 'active' : ''}`}
           onClick={() => setActiveTab('step3')}
         >
-          Stage 03 Detail: Sample Prediction
+          <span className="stepper-idx">Stage 03</span>
         </button>
-        <button 
-          className={`flow-tab-btn ${activeTab === 'step4' ? 'active' : ''}`}
+
+        <span className="stepper-arrow">→</span>
+
+        <button
+          type="button"
+          className={`stepper-pill ${activeTab === 'step4' ? 'active' : ''}`}
           onClick={() => setActiveTab('step4')}
         >
-          Stage 04 Detail: Boundary & Residual
+          <span className="stepper-idx">Stage 04</span>
         </button>
       </div>
 
-      {/* LIVE EQUATION READOUT BAR (Explicit transformation upon hover) */}
-      <div className="live-equation-readout">
-        {activeHover && hasLiveData ? (
-          <div className="equation-active-wrap">
-            <div className="equation-tag">EXPLICIT PIXEL TRANSFORMATION [ {activeHover.x}, {activeHover.y} ]</div>
-            <div className="equation-math">
-              <span className="eq-term">
-                Original[{activeHover.x}, {activeHover.y}] = <strong>{orgData[activeHover.y * 8 + activeHover.x]}</strong>
-              </span>
-              <span className="eq-op">──(Mode {selectedMode} {modeInfo.name} Projection)──&gt;</span>
-              <span className="eq-term" style={{ color: 'var(--c-blue)' }}>
-                Predicted = <strong>{predData[activeHover.y * 8 + activeHover.x]}</strong>
-              </span>
-              <span className="eq-op">──(Residual Subtraction)──&gt;</span>
-              <span className="eq-term" style={{ color: 'var(--c-magenta)' }}>
-                Residual = <strong>{resiData[activeHover.y * 8 + activeHover.x]}</strong>
-              </span>
-            </div>
-            {trace && (
-              <div className="equation-trace-text">
-                Prediction Derivation: {trace.text}
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="equation-placeholder">
-            Hover over any pixel in Stage 01 (Original), Stage 03 (Prediction), or Stage 04 (Residual) to view explicit step-by-step mathematical transformation
-          </div>
-        )}
-      </div>
-
-      {/* VIEW 1: ALL STAGES LIVE MATRICES (Directly matching User Mockup) */}
+      {/* 3. VIEW 1: THE LIVE EQUATION TRIO (Original - Prediction = Residual) */}
       {activeTab === 'all' && (
-        <div className="live-matrices-row">
-          {/* STAGE 01: Reference Boundary Samples & Original CU (8x8) */}
-          <div className="live-matrix-card">
-            <div className="live-matrix-header">
-              <div className="live-matrix-header-info">
-                <span className="stage-mini-badge" style={{ background: '#8DC63F', color: '#000' }}>STAGE 01</span>
-                <div className="live-matrix-title-wrap">
-                  <h3 className="live-matrix-title">ORIGINAL (Y) & BOUNDARY REFS</h3>
-                  <span className="live-matrix-sub">4N+1 (33) Reconstructed Boundary Samples framing 8×8 CU</span>
+        <>
+          <div className="equation-trio-row">
+            {/* CARD 1: Original CU & Boundary Refs */}
+            <div className="live-matrix-card">
+              <div className="live-matrix-header">
+                <div className="live-matrix-header-info">
+                  <div className="live-matrix-title-wrap">
+                    <h3 className="live-matrix-title">ORIGINAL ({channel})</h3>
+                  </div>
                 </div>
               </div>
-              <div className="view-toggle-wrap">
-                <button 
-                  className={`toggle-btn ${displayModeStage1 === 'both' ? 'active' : ''}`}
-                  onClick={() => setDisplayModeStage1('both')}
-                >
-                  Blend
-                </button>
-                <button 
-                  className={`toggle-btn ${displayModeStage1 === 'values' ? 'active' : ''}`}
-                  onClick={() => setDisplayModeStage1('values')}
-                >
-                  Values
-                </button>
-                <button 
-                  className={`toggle-btn ${displayModeStage1 === 'texture' ? 'active' : ''}`}
-                  onClick={() => setDisplayModeStage1('texture')}
-                >
-                  Texture
-                </button>
-              </div>
-            </div>
 
-            <div 
-              className="grid-container grid-17x17 pred-grid" 
-              style={{ width: '374px', height: '374px', position: 'relative' }}
-              onMouseLeave={() => handleCellHover(null)}
-            >
-              {/* Top-Left Corner Reference */}
               <div 
-                className="cell ref-cell" 
+                className="grid-container pred-grid" 
                 style={{ 
-                  gridColumn: 1, 
-                  gridRow: 1, 
-                  ...getRefStyle(refTopRaw[0], activeTopIndices.has(0) || activeLeftIndices.has(0), true, false)
+                  width: `${stageGridSize}px`, 
+                  height: `${stageGridSize}px`, 
+                  display: 'grid',
+                  gridTemplateColumns: `repeat(${S}, ${stageGridCellSize}px)`,
+                  gridTemplateRows: `repeat(${S}, ${stageGridCellSize}px)`,
+                  position: 'relative' 
                 }}
-                title="Top-Left Reference [-1, -1] (Corner)"
               >
-                {refTopRaw[0]}
+                {/* Frame around Original Block */}
+                <div 
+                  style={{
+                    position: 'absolute',
+                    top: stageGridCellSize,
+                    left: stageGridCellSize,
+                    width: N * stageGridCellSize,
+                    height: N * stageGridCellSize,
+                    border: '2px solid #0F172A',
+                    boxSizing: 'border-box',
+                    pointerEvents: 'none',
+                    zIndex: 10
+                  }} 
+                />
+
+                {/* Boundary Reference Samples */}
+                <ReferencePerimeter
+                  refTop={refTopRaw}
+                  refLeft={refLeftRaw}
+                  N={N}
+                  activeTopIndices={activeTopIndices}
+                  activeLeftIndices={activeLeftIndices}
+                  showCellText={showCellText}
+                  getRefStyle={getRefStyle}
+                  prefix="org"
+                />
+
+                {/* Original block cells */}
+                {orgData.map((val, idx) => {
+                  const x = idx % N;
+                  const y = Math.floor(idx / N);
+                  const isSelected = activeCoord && activeCoord.x === x && activeCoord.y === y;
+                  const { bg: cBg, color: cColor } = getSampleColor(val);
+
+                  return (
+                    <div 
+                      key={`org-cell-${idx}`}
+                      className="cell"
+                      onClick={() => handleCellClick({ x, y, val })}
+                      style={{
+                        gridColumn: x + 2,
+                        gridRow: y + 2,
+                        backgroundColor: cBg,
+                        color: cColor,
+                        fontWeight: 700,
+                        fontSize: stageGridCellSize >= 20 ? '0.62rem' : stageGridCellSize >= 15 ? '0.50rem' : '0.40rem',
+                        letterSpacing: '-0.5px',
+                        lineHeight: 1,
+                        overflow: 'hidden',
+                        whiteSpace: 'nowrap',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        boxSizing: 'border-box',
+                        cursor: 'pointer',
+                        border: isSelected ? `2px solid ${SELECTION_HIGHLIGHT_COLOR}` : '1px solid rgba(0, 0, 0, 0.18)',
+                        boxShadow: 'none',
+                        zIndex: isSelected ? 12 : 1,
+                        transform: 'none',
+                        transition: 'none'
+                      }}
+                      title={`Original [${x}, ${y}] = ${val}`}
+                    >
+                      {showCellText ? val : ''}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* OPERATOR MINUS (−) */}
+            <div className="equation-operator" title="Subtraction: Original minus Prediction">
+              <span>−</span>
+            </div>
+
+            {/* CARD 2: Sample Prediction Block */}
+            <div className="live-matrix-card">
+              <div className="live-matrix-header">
+                <div className="live-matrix-header-info">
+                  <div className="live-matrix-title-wrap">
+                    <h3 className="live-matrix-title">PREDICTION ({channel})</h3>
+                  </div>
+                </div>
               </div>
 
-              {/* Direct Top (8 samples: [0..7, -1]) */}
-              {refTopRaw.slice(1, 9).map((val, idx) => {
-                const topIdx = idx + 1;
-                const isActive = activeTopIndices.has(topIdx);
-                return (
-                  <div 
-                    key={`top-org-${idx}`} 
-                    className="cell ref-cell" 
-                    style={{ gridColumn: idx + 2, gridRow: 1, ...getRefStyle(val, isActive, false, false) }}
-                    title={`Top Reference [${idx}, -1] = ${val}`}
-                  >
-                    {val}
-                  </div>
-                );
-              })}
-
-              {/* Extended Top-Right (8 samples: [8..15, -1]) */}
-              {refTopRaw.slice(9).map((val, idx) => {
-                const topIdx = idx + 9;
-                const isActive = activeTopIndices.has(topIdx);
-                return (
-                  <div 
-                    key={`top-ext-org-${idx}`} 
-                    className="cell ref-cell ref-extended" 
-                    style={{ gridColumn: idx + 10, gridRow: 1, ...getRefStyle(val, isActive, false, true) }}
-                    title={`Top-Right Ext Reference [${idx + 8}, -1] = ${val}`}
-                  >
-                    {val}
-                  </div>
-                );
-              })}
-
-              {/* Direct Left (8 samples: [-1, 0..7]) */}
-              {refLeftRaw.slice(1, 9).map((val, idx) => {
-                const leftIdx = idx + 1;
-                const isActive = activeLeftIndices.has(leftIdx);
-                return (
-                  <div 
-                    key={`left-org-${idx}`} 
-                    className="cell ref-cell" 
-                    style={{ gridColumn: 1, gridRow: idx + 2, ...getRefStyle(val, isActive, false, false) }}
-                    title={`Left Reference [-1, ${idx}] = ${val}`}
-                  >
-                    {val}
-                  </div>
-                );
-              })}
-
-              {/* Extended Below-Left (8 samples: [-1, 8..15]) */}
-              {refLeftRaw.slice(9).map((val, idx) => {
-                const leftIdx = idx + 9;
-                const isActive = activeLeftIndices.has(leftIdx);
-                return (
-                  <div 
-                    key={`left-ext-org-${idx}`} 
-                    className="cell ref-cell ref-extended" 
-                    style={{ gridColumn: 1, gridRow: idx + 10, ...getRefStyle(val, isActive, false, true) }}
-                    title={`Below-Left Ext Reference [-1, ${idx + 8}] = ${val}`}
-                  >
-                    {val}
-                  </div>
-                );
-              })}
-
-              {/* Center 8x8 Original Block Container */}
               <div 
-                style={{
-                  gridColumn: '2 / span 8',
-                  gridRow: '2 / span 8',
-                  position: 'relative',
-                  width: 176,
-                  height: 176,
-                  overflow: 'hidden',
-                  border: '2px solid var(--c-magenta)',
-                  boxSizing: 'border-box'
+                className="grid-container pred-grid" 
+                style={{ 
+                  width: `${stageGridSize}px`, 
+                  height: `${stageGridSize}px`, 
+                  display: 'grid',
+                  gridTemplateColumns: `repeat(${S}, ${stageGridCellSize}px)`,
+                  gridTemplateRows: `repeat(${S}, ${stageGridCellSize}px)`,
+                  position: 'relative' 
                 }}
               >
-                {/* Cropped Image Texture Background */}
-                {imagePreview && displayModeStage1 !== 'values' && (
-                  <img 
-                    src={imagePreview} 
-                    alt="Original Luma Texture" 
-                    style={{
-                      position: 'absolute',
-                      top: 0,
-                      left: 0,
-                      width: `${origW}px`,
-                      height: `${origH}px`,
-                      transformOrigin: '0 0',
-                      transform: `scale(22) translate(-${ctuX * 64}px, -${ctuY * 64}px)`,
-                      zIndex: 0,
-                      imageRendering: 'pixelated',
-                      filter: 'grayscale(100%)',
-                      opacity: displayModeStage1 === 'texture' ? 1.0 : 0.4
+                {/* SVG Ray Tracing Layer (Connected strictly to cell borders) */}
+                {activeCoord && trace && (
+                  <svg 
+                    style={{ 
+                      position: 'absolute', 
+                      top: 0, 
+                      left: 0, 
+                      width: stageGridSize, 
+                      height: stageGridSize, 
+                      pointerEvents: 'none', 
+                      zIndex: 14 
                     }}
-                  />
-                )}
-
-                {/* 8x8 Cells Overlay */}
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 22px)', gridTemplateRows: 'repeat(8, 22px)', position: 'relative', zIndex: 1 }}>
-                  {orgData.map((val, idx) => {
-                    const x = idx % 8;
-                    const y = Math.floor(idx / 8);
-                    const isHovered = activeHover && activeHover.x === x && activeHover.y === y;
-                    return (
-                      <div 
-                        key={`org-cell-${idx}`}
-                        className="cell"
-                        onMouseEnter={() => handleCellHover({ x, y, val })}
-                        style={{
-                          backgroundColor: displayModeStage1 === 'values' 
-                            ? `rgb(${val}, ${val}, ${val})` 
-                            : (displayModeStage1 === 'texture' ? 'transparent' : 'rgba(0,0,0,0.15)'),
-                          color: displayModeStage1 === 'texture' ? 'transparent' : (val < 128 ? '#FFF' : '#000'),
-                          textShadow: displayModeStage1 === 'texture' ? 'none' : (val < 128 ? '0 0 2px #000' : '0 0 2px #FFF'),
-                          fontWeight: 700,
-                          fontSize: '0.58rem',
-                          letterSpacing: '-0.5px',
-                          lineHeight: 1,
-                          overflow: 'hidden',
-                          whiteSpace: 'nowrap',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          boxSizing: 'border-box',
-                          cursor: 'crosshair',
-                          boxShadow: isHovered ? '0 0 0 2px #000, 0 0 0 3px #FFD200' : 'none',
-                          zIndex: isHovered ? 12 : 1,
-                          transform: isHovered ? 'scale(1.12)' : 'none',
-                          transition: 'all 0.1s ease'
-                        }}
-                        title={`Original [${x}, ${y}] = ${val}`}
-                      >
-                        {displayModeStage1 !== 'texture' ? val : ''}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* Bottom-Right Metadata Card */}
-              <div 
-                style={{
-                  gridColumn: '10 / span 8',
-                  gridRow: '10 / span 8',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  justifyContent: 'center',
-                  alignItems: 'center',
-                  background: '#FAFAFA',
-                  border: '1.5px solid #000',
-                  padding: '8px',
-                  textAlign: 'center',
-                  fontSize: '0.68rem',
-                  color: '#333',
-                  boxSizing: 'border-box',
-                  width: '100%',
-                  height: '100%'
-                }}
-              >
-                <div style={{ fontWeight: 700, color: '#000', marginBottom: '4px' }}>INPUT BUFFER</div>
-                <div>Top: 17 Ref Pels</div>
-                <div>Left: 17 Ref Pels</div>
-                <div style={{ marginTop: '4px', fontWeight: 600, color: 'var(--c-magenta)' }}>
-                  Target: CU 8×8 (64)
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* STAGE 03: Sample Prediction Block (8x8) */}
-          <div className="live-matrix-card">
-            <div className="live-matrix-header">
-              <div className="live-matrix-header-info">
-                <span className="stage-mini-badge" style={{ background: 'var(--c-blue)', color: '#FFF' }}>STAGE 03</span>
-                <div className="live-matrix-title-wrap">
-                  <h3 className="live-matrix-title">PREDICTION (Y)</h3>
-                  <span className="live-matrix-sub">Mode {selectedMode}: {modeInfo.name} Directional Ray Tracing</span>
-                </div>
-              </div>
-              <div style={{ fontSize: '0.75rem', fontWeight: 700, fontFamily: 'JetBrains Mono', padding: '0.2rem 0.5rem', background: '#F0F0F0', border: '1px solid #CCC', flexShrink: 0 }}>
-                A = {angle}
-              </div>
-            </div>
-
-            <div 
-              className="grid-container grid-17x17 pred-grid" 
-              style={{ width: '374px', height: '374px', position: 'relative' }}
-              onMouseLeave={() => handleCellHover(null)}
-            >
-              {/* SVG Ray Tracing Layer */}
-              {activeHover && trace && (
-                <svg 
-                  style={{ 
-                    position: 'absolute', 
-                    top: 0, 
-                    left: 0, 
-                    width: 374, 
-                    height: 374, 
-                    pointerEvents: 'none', 
-                    zIndex: 11 
-                  }}
-                >
-                  {trace.refs.map((ref, idx) => {
-                    const x2 = 22 * (activeHover.x + 1) + 11;
-                    const y2 = 22 * (activeHover.y + 1) + 11;
-                    const x1 = ref.type === 'top' ? 22 * ref.index + 11 : 11;
-                    const y1 = ref.type === 'left' ? 22 * ref.index + 11 : 11;
-
-                    return (
-                      <g key={idx}>
+                  >
+                    {trace.refs.map((ref, idx) => {
+                      const { x1, y1, x2, y2 } = getRayBorderEndpoints(ref, activeCoord, stageGridCellSize);
+                      if (Math.hypot(x2 - x1, y2 - y1) < 1.0) return null;
+                      return (
                         <line 
+                          key={idx}
                           x1={x1} 
                           y1={y1} 
                           x2={x2} 
                           y2={y2} 
-                          stroke="#2563EB" 
+                          stroke={SELECTION_HIGHLIGHT_COLOR} 
                           strokeWidth="2" 
-                          strokeDasharray="3 2" 
+                          strokeDasharray="4 2" 
                         />
-                        <circle cx={x1} cy={y1} r="3.5" fill="#2563EB" stroke="#FFFFFF" strokeWidth="1" />
-                      </g>
-                    );
-                  })}
-                  <circle 
-                    cx={22 * (activeHover.x + 1) + 11} 
-                    cy={22 * (activeHover.y + 1) + 11} 
-                    r="4" 
-                    fill="#2563EB" 
-                    stroke="#FFFFFF" 
-                    strokeWidth="1.5" 
-                  />
-                </svg>
-              )}
+                      );
+                    })}
+                  </svg>
+                )}
 
-              {/* Green border frame around 8x8 Prediction Block */}
-              <div 
-                style={{
-                  position: 'absolute',
-                  top: 22,
-                  left: 22,
-                  width: 176,
-                  height: 176,
-                  border: '2px solid var(--c-green)',
-                  boxSizing: 'border-box',
-                  pointerEvents: 'none',
-                  zIndex: 10
-                }} 
-              />
-
-              {/* Top-Left Corner Reference */}
-              <div 
-                className="cell ref-cell" 
-                style={{ 
-                  gridColumn: 1, 
-                  gridRow: 1, 
-                  ...getRefStyle(refTopActive[0], activeTopIndices.has(0) || activeLeftIndices.has(0), true, false)
-                }}
-                title="Top-Left [-1,-1] (Corner)"
-              >
-                {refTopActive[0]}
-              </div>
-
-              {/* Direct Top (8 samples: [0..7, -1]) */}
-              {refTopActive.slice(1, 9).map((val, idx) => {
-                const topIdx = idx + 1;
-                const isActive = activeTopIndices.has(topIdx);
-                return (
-                  <div 
-                    key={`top-pred-${idx}`} 
-                    className="cell ref-cell" 
-                    style={{ gridColumn: idx + 2, gridRow: 1, ...getRefStyle(val, isActive, false, false) }}
-                    title={`Top [${idx},-1] = ${val}`}
-                  >
-                    {val}
-                  </div>
-                );
-              })}
-
-              {/* Extended Top-Right (8 samples: [8..15, -1]) */}
-              {refTopActive.slice(9).map((val, idx) => {
-                const topIdx = idx + 9;
-                const isActive = activeTopIndices.has(topIdx);
-                return (
-                  <div 
-                    key={`top-ext-pred-${idx}`} 
-                    className="cell ref-cell ref-extended" 
-                    style={{ gridColumn: idx + 10, gridRow: 1, ...getRefStyle(val, isActive, false, true) }}
-                    title={`Top-Right Ext [${idx+8},-1] = ${val}`}
-                  >
-                    {val}
-                  </div>
-                );
-              })}
-
-              {/* Direct Left (8 samples: [-1, 0..7]) */}
-              {refLeftActive.slice(1, 9).map((val, idx) => {
-                const leftIdx = idx + 1;
-                const isActive = activeLeftIndices.has(leftIdx);
-                return (
-                  <div 
-                    key={`left-pred-${idx}`} 
-                    className="cell ref-cell" 
-                    style={{ gridColumn: 1, gridRow: idx + 2, ...getRefStyle(val, isActive, false, false) }}
-                    title={`Left [-1,${idx}] = ${val}`}
-                  >
-                    {val}
-                  </div>
-                );
-              })}
-
-              {/* Extended Below-Left (8 samples: [-1, 8..15]) */}
-              {refLeftActive.slice(9).map((val, idx) => {
-                const leftIdx = idx + 9;
-                const isActive = activeLeftIndices.has(leftIdx);
-                return (
-                  <div 
-                    key={`left-ext-pred-${idx}`} 
-                    className="cell ref-cell ref-extended" 
-                    style={{ gridColumn: 1, gridRow: idx + 10, ...getRefStyle(val, isActive, false, true) }}
-                    title={`Below-Left Ext [-1,${idx+8}] = ${val}`}
-                  >
-                    {val}
-                  </div>
-                );
-              })}
-
-              {/* 8x8 Prediction block cells */}
-              {predData.map((val, idx) => {
-                const x = idx % 8;
-                const y = Math.floor(idx / 8);
-                const isHovered = activeHover && activeHover.x === x && activeHover.y === y;
-
-                return (
-                  <div 
-                    key={`pred-live-${selectedMode}-${idx}`} 
-                    className="cell pred-cell pred-cell-wave" 
-                    onMouseEnter={() => handleCellHover({ x, y, val })}
-                    style={{ 
-                      gridColumn: x + 2, 
-                      gridRow: y + 2, 
-                      backgroundColor: `rgb(${val}, ${val}, ${val})`, 
-                      color: val < 128 ? '#FFF' : '#000',
-                      textShadow: val < 128 ? '0 0 2px #000' : '0 0 2px #FFF',
-                      cursor: 'crosshair',
-                      boxShadow: isHovered ? '0 0 0 2px #000, 0 0 0 3px #FFD200' : 'none',
-                      zIndex: isHovered ? 12 : 1,
-                      transform: isHovered ? 'scale(1.12)' : 'none',
-                      transition: 'all 0.1s ease',
-                      animationDelay: `${getWavefrontDelay(selectedMode, x, y, 8)}s`,
-                      fontSize: '0.58rem',
-                      fontWeight: 700,
-                      letterSpacing: '-0.5px',
-                      lineHeight: 1,
-                      overflow: 'hidden',
-                      whiteSpace: 'nowrap',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      boxSizing: 'border-box'
-                    }}
-                    title={`Pred [${x}, ${y}] = ${val}`}
-                  >
-                    {val}
-                  </div>
-                );
-              })}
-
-              {/* Bottom-right Traceback info box */}
-              {activeHover && trace ? (
+                {/* Frame around Prediction Block */}
                 <div 
                   style={{
-                    gridColumn: '10 / span 8',
-                    gridRow: '10 / span 8',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    alignItems: 'flex-start',
-                    justifyContent: 'center',
-                    background: '#F8FAFC',
-                    border: '1.5px solid #CBD5E1',
-                    padding: '8px',
+                    position: 'absolute',
+                    top: stageGridCellSize,
+                    left: stageGridCellSize,
+                    width: N * stageGridCellSize,
+                    height: N * stageGridCellSize,
+                    border: '2px solid #0F172A',
                     boxSizing: 'border-box',
-                    overflow: 'hidden'
-                  }}
-                >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', width: '100%', alignItems: 'center', borderBottom: '1px solid #E2E8F0', paddingBottom: '3px', marginBottom: '4px' }}>
-                    <span style={{ fontSize: '0.62rem', fontWeight: 800, color: '#475569', textTransform: 'uppercase' }}>
-                      Derivation [{activeHover.x}, {activeHover.y}]
-                    </span>
-                    <span style={{ fontSize: '0.72rem', fontWeight: 800, fontFamily: 'JetBrains Mono', color: '#2563EB' }}>
-                      Pred: {predData[activeHover.y * 8 + activeHover.x]}
-                    </span>
-                  </div>
-                  <div style={{ fontSize: '0.62rem', color: '#1E293B', lineHeight: 1.35, fontWeight: 500, fontFamily: 'JetBrains Mono', wordBreak: 'break-word' }}>
-                    {trace.text}
-                  </div>
-                </div>
-              ) : (
-                <div 
-                  style={{
-                    gridColumn: '10 / span 8',
-                    gridRow: '10 / span 8',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    background: '#F8FAFC',
-                    border: '1px dashed #CBD5E1',
-                    padding: '8px',
-                    textAlign: 'center',
-                    boxSizing: 'border-box'
-                  }}
-                >
-                  <span style={{ fontSize: '0.68rem', color: '#64748B', fontWeight: 600 }}>Hover any pixel [x, y]</span>
-                  <span style={{ fontSize: '0.58rem', color: '#94A3B8', marginTop: '2px' }}>to inspect exact arithmetic formula</span>
-                </div>
-              )}
-            </div>
-          </div>
+                    pointerEvents: 'none',
+                    zIndex: 10
+                  }} 
+                />
 
-          {/* STAGE 04: Residual Matrix (Y) */}
-          <div className="live-matrix-card">
-            <div className="live-matrix-header">
-              <div className="live-matrix-header-info">
-                <span className="stage-mini-badge" style={{ background: 'var(--c-magenta)', color: '#FFF' }}>STAGE 04</span>
-                <div className="live-matrix-title-wrap">
-                  <h3 className="live-matrix-title">RESIDUAL (Y)</h3>
-                  <span className="live-matrix-sub">Org[x, y] − Pred[x, y] = Resi[x, y]</span>
-                </div>
-              </div>
-              <div style={{ fontSize: '0.75rem', fontWeight: 700, fontFamily: 'JetBrains Mono', color: 'var(--c-magenta)', padding: '0.2rem 0.5rem', background: '#FFF0F5', border: '1px solid var(--c-magenta)', flexShrink: 0 }}>
-                COST: {modeData?.cost?.toFixed(1) || '0.0'}
-              </div>
-            </div>
+                {/* Active Reference Perimeter */}
+                <ReferencePerimeter
+                  refTop={refTopActive}
+                  refLeft={refLeftActive}
+                  N={N}
+                  activeTopIndices={activeTopIndices}
+                  activeLeftIndices={activeLeftIndices}
+                  showCellText={showCellText}
+                  getRefStyle={getRefStyle}
+                  prefix="pred"
+                />
 
-            <div 
-              style={{ 
-                width: '374px', 
-                height: '374px', 
-                display: 'flex', 
-                flexDirection: 'column', 
-                alignItems: 'center', 
-                justifyContent: 'center',
-                background: '#F9F9F9',
-                border: '2px solid var(--c-black)',
-                padding: '12px'
-              }}
-              onMouseLeave={() => handleCellHover(null)}
-            >
-              {/* 8x8 Residual Matrix Grid */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 38px)', gridTemplateRows: 'repeat(8, 38px)', border: '2px solid #000' }}>
-                {resiData.map((val, idx) => {
-                  const x = idx % 8;
-                  const y = Math.floor(idx / 8);
-                  const isHovered = activeHover && activeHover.x === x && activeHover.y === y;
-
-                  let bg = '';
-                  let color = '';
-                  if (val === 0) {
-                    bg = '#E6E6E6';
-                    color = '#888';
-                  } else {
-                    const intensity = Math.min(1, Math.abs(val) / 64);
-                    bg = val > 0 ? `rgba(222, 0, 106, ${intensity})` : `rgba(245, 130, 32, ${intensity})`;
-                    color = intensity > 0.45 ? '#FFF' : '#000';
-                  }
+                {/* Prediction block cells */}
+                {predData.map((val, idx) => {
+                  const x = idx % N;
+                  const y = Math.floor(idx / N);
+                  const isSelected = activeCoord && activeCoord.x === x && activeCoord.y === y;
+                  const { bg: cBg, color: cColor } = getSampleColor(val);
 
                   return (
                     <div 
-                      key={`resi-live-${idx}`}
-                      className="cell"
-                      onMouseEnter={() => handleCellHover({ x, y, val })}
-                      style={{
-                        backgroundColor: bg,
-                        color: color,
+                      key={`pred-live-${selectedMode}-${idx}`} 
+                      className="cell pred-cell" 
+                      onClick={() => handleCellClick({ x, y, val })}
+                      style={{ 
+                        gridColumn: x + 2, 
+                        gridRow: y + 2, 
+                        backgroundColor: cBg, 
+                        color: cColor, 
+                        cursor: 'pointer',
+                        border: isSelected ? `2px solid ${SELECTION_HIGHLIGHT_COLOR}` : '1px solid rgba(0, 0, 0, 0.18)',
+                        boxShadow: 'none',
+                        zIndex: isSelected ? 12 : 1,
+                        transform: 'none',
+                        transition: 'none',
+                        fontSize: stageGridCellSize >= 20 ? '0.62rem' : stageGridCellSize >= 15 ? '0.50rem' : '0.40rem',
                         fontWeight: 700,
-                        fontSize: '0.72rem',
-                        fontFamily: 'JetBrains Mono',
-                        cursor: 'crosshair',
-                        boxShadow: isHovered ? '0 0 0 2px #000, 0 0 0 3px #FFD200' : 'none',
-                        zIndex: isHovered ? 12 : 1,
-                        transform: isHovered ? 'scale(1.12)' : 'none',
-                        transition: 'all 0.1s ease',
                         letterSpacing: '-0.5px',
                         lineHeight: 1,
                         overflow: 'hidden',
@@ -928,459 +626,90 @@ const IntraPredictionFlow = ({
                         justifyContent: 'center',
                         boxSizing: 'border-box'
                       }}
-                      title={`Org(${orgData[idx]}) − Pred(${predData[idx]}) = Resi(${val})`}
+                      title={`Pred [${x}, ${y}] = ${val}`}
                     >
-                      {val > 0 ? `+${val}` : val}
+                      {showCellText ? val : ''}
                     </div>
                   );
                 })}
               </div>
+            </div>
 
-              {/* Residual Legend */}
-              <div style={{ display: 'flex', gap: '1.25rem', marginTop: '14px', fontSize: '0.75rem', fontFamily: 'JetBrains Mono' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                  <span style={{ width: 12, height: 12, background: 'var(--c-magenta)', display: 'inline-block' }}></span>
-                  <span>+ Under-pred</span>
+            {/* OPERATOR EQUALS (=) */}
+            <div className="equation-operator" title="Equals: Yields Residual Error Matrix">
+              <span>=</span>
+            </div>
+
+            {/* CARD 3: STAGE 04 Residual Matrix */}
+            <ResidualMatrix
+              resiData={resiData}
+              orgData={orgData}
+              predData={predData}
+              N={N}
+              cost={modeData?.cost}
+              channel={channel}
+              stageGridSize={stageGridSize}
+              resiCellSize={resiCellSize}
+              showResiText={showResiText}
+              activeCoord={activeCoord}
+              onCellClick={handleCellClick}
+            />
+          </div>
+
+          {/* 4. DYNAMIC PIXEL INSPECTOR HUD (Replaces static 50px empty banner) */}
+          <div className="pixel-inspector-hud">
+            {activeCoord && trace ? (
+              <div className="hud-content-active">
+                <div className="hud-target-badge">
+                  PIXEL [{activeCoord.x}, {activeCoord.y}]
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                  <span style={{ width: 12, height: 12, background: 'var(--c-orange)', display: 'inline-block' }}></span>
-                  <span>− Over-pred</span>
+                <div className="hud-calc-line">
+                  <span className="hud-val org">Org: {orgData[activeCoord.y * N + activeCoord.x]}</span>
+                  <span className="hud-op">−</span>
+                  <span className="hud-val pred">Pred: {predData[activeCoord.y * N + activeCoord.x]}</span>
+                  <span className="hud-op">=</span>
+                  <span className="hud-val resi">
+                    Resi: {resiData[activeCoord.y * N + activeCoord.x] > 0 ? `+${resiData[activeCoord.y * N + activeCoord.x]}` : resiData[activeCoord.y * N + activeCoord.x]}
+                  </span>
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                  <span style={{ width: 12, height: 12, background: '#E6E6E6', display: 'inline-block', border: '1px solid #CCC' }}></span>
-                  <span>0 Exact match</span>
+                <div className="hud-formula-line">
+                  <span className="hud-formula-tag">RAY TRACE:</span>
+                  <span className="hud-formula-text">{trace.text}</span>
                 </div>
               </div>
-            </div>
+            ) : (
+              <div className="hud-content-idle">
+                <span className="hud-idle-hint">[PIXEL INSPECTION: NONE SELECTED]</span>
+              </div>
+            )}
           </div>
-        </div>
+        </>
       )}
 
-      {/* VIEW 2: STAGE 01 DETAIL (EXPLICIT INPUT ---> PROCESS ---> OUTPUT) */}
-      {activeTab === 'step1' && (
-        <div className="stage-detail-box">
-          <div className="stage-detail-header">
-            <span className="stage-tag">STAGE 01 DETAIL</span>
-            <h3 className="stage-title">Reference Sample Preparation & Boundary Fetching</h3>
-            <span className="stage-func">HM Codebase: TComPrediction::initIntraPatternChType() & fillReferenceSamples() (TComPattern.cpp)</span>
-          </div>
-
-          <div className="stage-io-row">
-            {/* INPUT CARD */}
-            <div className="stage-io-col">
-              <span className="io-col-badge">INPUT DATA</span>
-              <div className="stage-io-card">
-                <div className="io-meta-line"><strong>Variable:</strong> <code>piRoiOrigin</code></div>
-                <div className="io-meta-line"><strong>C++ Type:</strong> <code>const Pel*</code> (Reconstructed Picture)</div>
-                <div className="io-meta-line"><strong>Coordinates:</strong> CTU [{ctuX}, {ctuY}] Offset ({ctuX * 64}, {ctuY * 64})</div>
-                <div className="io-meta-line"><strong>Flags:</strong> 5 Neighboring Availability Statuses</div>
-
-                {/* Input Visual */}
-                <div className="io-visual-box" style={{ marginTop: '10px' }}>
-                  {imagePreview ? (
-                    <div style={{ position: 'relative', width: '220px', height: '140px', overflow: 'hidden', border: '2px solid #000' }}>
-                      <img src={imagePreview} alt="Reconstructed Frame" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                      <div 
-                        style={{
-                          position: 'absolute',
-                          left: '30%',
-                          top: '30%',
-                          width: '40px',
-                          height: '40px',
-                          border: '2px solid #FFD200',
-                          background: 'rgba(255, 210, 0, 0.25)'
-                        }} 
-                      />
-                    </div>
-                  ) : <div>No Image Available</div>}
-                </div>
-                <span className="io-caption">Surrounding reconstructed pixels in frame</span>
-              </div>
-            </div>
-
-            {/* PROCESS CARD */}
-            <div className="stage-io-arrow-col">
-              <div className="stage-io-arrow">→</div>
-              <span className="process-label">initIntraPatternChType</span>
-            </div>
-
-            <div className="stage-io-col" style={{ flex: 1.2 }}>
-              <span className="io-col-badge" style={{ background: '#000', color: '#FFF' }}>HM C++ PROCESS & FORMULA</span>
-              <div className="stage-io-card" style={{ background: '#FFF' }}>
-                <div className="formula-badge">HEVC Spec §8.4.4.2.2 Boundary Extraction</div>
-                <div className="math-display" style={{ fontSize: '0.78rem' }}>
-                  <div className="math-row">
-                    <span className="math-lhs">Top Samples:</span>
-                    <span className="math-rhs">p[x][-1] = Reco[xCU + x, yCU - 1], &nbsp; x ∈ [-1, 2N-1]</span>
-                  </div>
-                  <div className="math-row">
-                    <span className="math-lhs">Left Samples:</span>
-                    <span className="math-rhs">p[-1][y] = Reco[xCU - 1, yCU + y], &nbsp; y ∈ [0, 2N-1]</span>
-                  </div>
-                </div>
-
-                <div style={{ marginTop: '10px', fontSize: '0.74rem', color: '#333', lineHeight: 1.4 }}>
-                  • Evaluates 5 boundary flags: <code>isAboveLeftAvailable</code>, <code>isAboveAvailable</code>, <code>isAboveRightAvailable</code>, <code>isLeftAvailable</code>, <code>isBelowLeftAvailable</code>.<br />
-                  • Gathers 1 Top-Left + 2N (16) Above + 2N (16) Left = <strong>4N + 1 (33 samples)</strong>.
-                </div>
-              </div>
-            </div>
-
-            {/* OUTPUT CARD */}
-            <div className="stage-io-arrow-col">
-              <div className="stage-io-arrow">→</div>
-              <span className="process-label">pRaw[33]</span>
-            </div>
-
-            <div className="stage-io-col">
-              <span className="io-col-badge" style={{ background: 'var(--c-green)', color: '#000' }}>OUTPUT DATA</span>
-              <div className="stage-io-card">
-                <div className="io-meta-line"><strong>Variable:</strong> <code>piIntraTemp</code> (PRED_BUF_UNFILTERED)</div>
-                <div className="io-meta-line"><strong>C++ Type:</strong> <code>Pel[4N+1]</code> (1 × 33 vector)</div>
-                <div className="io-meta-line"><strong>Sample Count:</strong> 33 Raw Perimeter Samples</div>
-
-                {/* Output Strip Visual */}
-                <div className="io-visual-box" style={{ marginTop: '10px' }}>
-                  <div style={{ fontSize: '0.7rem', fontWeight: 700, marginBottom: '4px' }}>Top Row (17 Pels):</div>
-                  <div style={{ display: 'flex', gap: '1px', flexWrap: 'wrap', maxWidth: '220px' }}>
-                    {refTopRaw.map((v, i) => (
-                      <div key={i} style={{ width: 12, height: 16, background: `rgb(${v},${v},${v})`, color: v<128?'#FFF':'#000', fontSize: '0.45rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        {v}
-                      </div>
-                    ))}
-                  </div>
-                  <div style={{ fontSize: '0.7rem', fontWeight: 700, marginTop: '6px', marginBottom: '4px' }}>Left Col (17 Pels):</div>
-                  <div style={{ display: 'flex', gap: '1px', flexWrap: 'wrap', maxWidth: '220px' }}>
-                    {refLeftRaw.map((v, i) => (
-                      <div key={i} style={{ width: 12, height: 16, background: `rgb(${v},${v},${v})`, color: v<128?'#FFF':'#000', fontSize: '0.45rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        {v}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                <span className="io-caption">33 Raw Boundary Samples ready for MDIS</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* VIEW 3: STAGE 02 DETAIL (EXPLICIT INPUT ---> PROCESS ---> OUTPUT) */}
-      {activeTab === 'step2' && (
-        <div className="stage-detail-box">
-          <div className="stage-detail-header">
-            <span className="stage-tag">STAGE 02 DETAIL</span>
-            <h3 className="stage-title">Reference Substitution & Mode-Dependent Smoothing (MDIS)</h3>
-            <span className="stage-func">HM Codebase: TComPrediction::initIntraPatternChType() & fillReferenceSamples() (TComPattern.cpp)</span>
-          </div>
-
-          <div className="stage-io-row">
-            {/* INPUT CARD */}
-            <div className="stage-io-col">
-              <span className="io-col-badge">INPUT: RAW REFS</span>
-              <div className="stage-io-card">
-                <div className="io-meta-line"><strong>Variable:</strong> <code>piIntraTemp</code> (PRED_BUF_UNFILTERED)</div>
-                <div className="io-meta-line"><strong>Active Mode:</strong> Mode {selectedMode} ({modeInfo.name})</div>
-                <div className="io-meta-line"><strong>MDIS Status:</strong> {isMDISSmoothed ? '3-Tap Filter Triggered' : 'Direct Bypass'}</div>
-
-                <div className="io-visual-box" style={{ marginTop: '10px' }}>
-                  <div style={{ fontSize: '0.7rem', fontWeight: 700 }}>Raw Top Reference:</div>
-                  <div style={{ display: 'flex', gap: '1px', flexWrap: 'wrap', maxWidth: '220px' }}>
-                    {refTopRaw.map((v, i) => (
-                      <div key={i} style={{ width: 12, height: 16, background: `rgb(${v},${v},${v})`, color: v<128?'#FFF':'#000', fontSize: '0.45rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        {v}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                <span className="io-caption">Unsmoothed raw perimeter array</span>
-              </div>
-            </div>
-
-            {/* PROCESS CARD */}
-            <div className="stage-io-arrow-col">
-              <div className="stage-io-arrow">→</div>
-              <span className="process-label">[1, 2, 1] / 4</span>
-            </div>
-
-            <div className="stage-io-col" style={{ flex: 1.2 }}>
-              <span className="io-col-badge" style={{ background: '#000', color: '#FFF' }}>HM C++ PROCESS & FORMULA</span>
-              <div className="stage-io-card" style={{ background: '#FFF' }}>
-                <div className="formula-badge">3-Tap Smoothing Lowpass Kernel [1, 2, 1] / 4</div>
-                <div className="math-display" style={{ fontSize: '0.78rem' }}>
-                  <div className="math-row">
-                    <span className="math-lhs">Top Filter:</span>
-                    <span className="math-rhs">p'[x][-1] = (p[x-1][-1] + 2·p[x][-1] + p[x+1][-1] + 2) &gt;&gt; 2</span>
-                  </div>
-                  <div className="math-row">
-                    <span className="math-lhs">Left Filter:</span>
-                    <span className="math-rhs">p'[-1][y] = (p[-1][y-1] + 2·p[-1][y] + p[-1][y+1] + 2) &gt;&gt; 2</span>
-                  </div>
-                </div>
-
-                <div style={{ marginTop: '10px', fontSize: '0.74rem', color: '#333', lineHeight: 1.4 }}>
-                  • <strong>MDIS Criteria for N=8:</strong> Modes &#123;0 (Planar), 2, 18, 34 (45° Diagonals)&#125; activate the 3-tap filter to eliminate high-frequency perimeter noise. All other modes bypass to preserve crisp directional edges.
-                </div>
-              </div>
-            </div>
-
-            {/* OUTPUT CARD */}
-            <div className="stage-io-arrow-col">
-              <div className="stage-io-arrow">→</div>
-              <span className="process-label">pFilt[33]</span>
-            </div>
-
-            <div className="stage-io-col">
-              <span className="io-col-badge" style={{ background: 'var(--c-blue)', color: '#FFF' }}>OUTPUT: CLEAN REFS</span>
-              <div className="stage-io-card">
-                <div className="io-meta-line"><strong>Variable:</strong> <code>m_piYuvExt[...][PRED_BUF_FILTERED]</code></div>
-                <div className="io-meta-line"><strong>Status:</strong> {isMDISSmoothed ? 'Smoothed Array' : 'Direct Pass-through'}</div>
-                <div className="io-meta-line"><strong>Output Count:</strong> 33 Clean Samples</div>
-
-                <div className="io-visual-box" style={{ marginTop: '10px' }}>
-                  <div style={{ fontSize: '0.7rem', fontWeight: 700 }}>Effective Top Reference:</div>
-                  <div style={{ display: 'flex', gap: '1px', flexWrap: 'wrap', maxWidth: '220px' }}>
-                    {refTopActive.map((v, i) => (
-                      <div key={i} style={{ width: 12, height: 16, background: `rgb(${v},${v},${v})`, color: v<128?'#FFF':'#000', fontSize: '0.45rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        {v}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                <span className="io-caption">Supplied to predIntraAng for matrix generation</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* VIEW 4: STAGE 03 DETAIL (EXPLICIT INPUT ---> PROCESS ---> OUTPUT) */}
-      {activeTab === 'step3' && (
-        <div className="stage-detail-box">
-          <div className="stage-detail-header">
-            <span className="stage-tag">STAGE 03 DETAIL</span>
-            <h3 className="stage-title">Sample Prediction: Planar / DC / 33 Directional Angles</h3>
-            <span className="stage-func">HM Codebase: TComPrediction::xPredIntraAng() & xPredIntraPlanar()</span>
-          </div>
-
-          <div className="stage-io-row">
-            {/* INPUT CARD */}
-            <div className="stage-io-col">
-              <span className="io-col-badge">INPUT: REFS & PARAMS</span>
-              <div className="stage-io-card">
-                <div className="io-meta-line"><strong>Variable:</strong> <code>ptrSrc = getPredictorPtr(...)</code></div>
-                <div className="io-meta-line"><strong>Active Mode:</strong> Mode {selectedMode} ({modeInfo.name})</div>
-                <div className="io-meta-line"><strong>Angle Displacement A:</strong> {angle} (1/32nd sub-pel)</div>
-                <div className="io-meta-line"><strong>Inverse Angle B:</strong> {invAngle || 'None'}</div>
-
-                <div className="io-visual-box" style={{ marginTop: '10px' }}>
-                  <div style={{ fontSize: '0.7rem', fontWeight: 700 }}>Perimeter Buffer:</div>
-                  <div style={{ display: 'flex', gap: '1px', flexWrap: 'wrap', maxWidth: '220px' }}>
-                    {refTopActive.slice(0, 10).map((v, i) => (
-                      <div key={i} style={{ width: 18, height: 18, background: `rgb(${v},${v},${v})`, color: v<128?'#FFF':'#000', fontSize: '0.55rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        {v}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                <span className="io-caption">33 reference samples guiding directional projection</span>
-              </div>
-            </div>
-
-            {/* PROCESS CARD */}
-            <div className="stage-io-arrow-col">
-              <div className="stage-io-arrow">→</div>
-              <span className="process-label">xPredIntraAng</span>
-            </div>
-
-            <div className="stage-io-col" style={{ flex: 1.2 }}>
-              <span className="io-col-badge" style={{ background: '#000', color: '#FFF' }}>HM C++ PROCESS & FORMULA</span>
-              <div className="stage-io-card" style={{ background: '#FFF' }}>
-                <div className="formula-badge">Mathematical Prediction for Mode {selectedMode}</div>
-                {selectedMode === 0 ? (
-                  <div className="math-display" style={{ fontSize: '0.78rem' }}>
-                    <div className="math-row">
-                      <span className="math-lhs">p_h =</span>
-                      <span className="math-rhs">(N - 1 - x)·p[-1][y] + (x + 1)·p[N][-1]</span>
-                    </div>
-                    <div className="math-row">
-                      <span className="math-lhs">p_v =</span>
-                      <span className="math-rhs">(N - 1 - y)·p[x][-1] + (y + 1)·p[-1][N]</span>
-                    </div>
-                    <div className="math-row">
-                      <span className="math-lhs">pred[x, y] =</span>
-                      <span className="math-rhs">(p_h + p_v + N) &gt;&gt; (log₂(N) + 1)</span>
-                    </div>
-                  </div>
-                ) : selectedMode === 1 ? (
-                  <div className="math-display" style={{ fontSize: '0.78rem' }}>
-                    <div className="math-row">
-                      <span className="math-lhs">dcVal =</span>
-                      <span className="math-rhs">[ ∑ p[x'][-1] + ∑ p[-1][y'] + N ] &gt;&gt; (log₂(N) + 1)</span>
-                    </div>
-                    <div className="math-row">
-                      <span className="math-lhs">pred[x, y] =</span>
-                      <span className="math-rhs">dcVal &nbsp; (Uniform Flat Average)</span>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="math-display" style={{ fontSize: '0.78rem' }}>
-                    <div className="math-row">
-                      <span className="math-lhs">deltaPos =</span>
-                      <span className="math-rhs">(y + 1) · {angle}</span>
-                    </div>
-                    <div className="math-row">
-                      <span className="math-lhs">iIdx =</span>
-                      <span className="math-rhs">deltaPos &gt;&gt; 5, &nbsp; iFact = deltaPos &amp; 31</span>
-                    </div>
-                    <div className="math-row">
-                      <span className="math-lhs">pred[x, y] =</span>
-                      <span className="math-rhs">
-                        iFact ≠ 0 ? [ (32 - iFact)·ref[x+iIdx+1] + iFact·ref[x+iIdx+2] + 16 ] &gt;&gt; 5 : ref[x+iIdx+1]
-                      </span>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* OUTPUT CARD */}
-            <div className="stage-io-arrow-col">
-              <div className="stage-io-arrow">→</div>
-              <span className="process-label">piPred[8×8]</span>
-            </div>
-
-            <div className="stage-io-col">
-              <span className="io-col-badge" style={{ background: 'var(--c-blue)', color: '#FFF' }}>OUTPUT: PRED BLOCK</span>
-              <div className="stage-io-card">
-                <div className="io-meta-line"><strong>Variable:</strong> <code>piPred</code> (TComPrediction)</div>
-                <div className="io-meta-line"><strong>Dimensions:</strong> 8 × 8 (64 Pel)</div>
-                <div className="io-meta-line"><strong>Mode:</strong> {modeInfo.name}</div>
-
-                <div className="io-visual-box" style={{ marginTop: '10px' }}>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 16px)', gridTemplateRows: 'repeat(8, 16px)' }}>
-                    {predData.map((v, i) => (
-                      <div key={i} style={{ backgroundColor: `rgb(${v},${v},${v})`, color: v<128?'#FFF':'#000', fontSize: '0.45rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        {v}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                <span className="io-caption">Predicted 8×8 block ready for residual subtraction</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* VIEW 5: STAGE 04 DETAIL (EXPLICIT INPUT ---> PROCESS ---> OUTPUT) */}
-      {activeTab === 'step4' && (
-        <div className="stage-detail-box">
-          <div className="stage-detail-header">
-            <span className="stage-tag">STAGE 04 DETAIL</span>
-            <h3 className="stage-title">Boundary Filtering & Residual Generation</h3>
-            <span className="stage-func">HM Codebase: TComPrediction::xDCPredFiltering() & TEncSearch residual subtraction</span>
-          </div>
-
-          <div className="stage-io-row">
-            {/* INPUT CARD */}
-            <div className="stage-io-col">
-              <span className="io-col-badge">INPUT: ORG & PRED</span>
-              <div className="stage-io-card">
-                <div className="io-meta-line"><strong>Variable 1:</strong> <code>piOrg</code> (Original 8×8 Block)</div>
-                <div className="io-meta-line"><strong>Variable 2:</strong> <code>piPred</code> (Predicted 8×8 Block)</div>
-                <div className="io-meta-line"><strong>Edge Filter:</strong> {hasEdgeFilter ? 'Active (Row 0 / Col 0)' : 'Bypass'}</div>
-
-                <div className="io-visual-box" style={{ marginTop: '10px', display: 'flex', gap: '8px' }}>
-                  <div>
-                    <div style={{ fontSize: '0.65rem', fontWeight: 700 }}>Original:</div>
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 10px)', gridTemplateRows: 'repeat(8, 10px)' }}>
-                      {orgData.map((v, i) => (
-                        <div key={i} style={{ backgroundColor: `rgb(${v},${v},${v})` }} />
-                      ))}
-                    </div>
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.65rem', fontWeight: 700 }}>Prediction:</div>
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 10px)', gridTemplateRows: 'repeat(8, 10px)' }}>
-                      {predData.map((v, i) => (
-                        <div key={i} style={{ backgroundColor: `rgb(${v},${v},${v})` }} />
-                      ))}
-                    </div>
-                  </div>
-                </div>
-                <span className="io-caption">Original texture and prediction model</span>
-              </div>
-            </div>
-
-            {/* PROCESS CARD */}
-            <div className="stage-io-arrow-col">
-              <div className="stage-io-arrow">→</div>
-              <span className="process-label">Org − Pred</span>
-            </div>
-
-            <div className="stage-io-col" style={{ flex: 1.2 }}>
-              <span className="io-col-badge" style={{ background: '#000', color: '#FFF' }}>HM C++ PROCESS & FORMULA</span>
-              <div className="stage-io-card" style={{ background: '#FFF' }}>
-                <div className="formula-badge">Boundary Smoothing & Residual Subtraction</div>
-                <div className="math-display" style={{ fontSize: '0.78rem' }}>
-                  <div className="math-row">
-                    <span className="math-lhs">Residual Matrix:</span>
-                    <span className="math-rhs">resi[x, y] = org[x, y] - pred[x, y]</span>
-                  </div>
-                  {selectedMode === 1 && (
-                    <div className="math-row">
-                      <span className="math-lhs">DC Corner Filter:</span>
-                      <span className="math-rhs">pred[0,0] = (p[0,-1] + p[-1,0] + 2·dcVal + 2) &gt;&gt; 2</span>
-                    </div>
-                  )}
-                  {selectedMode === 26 && (
-                    <div className="math-row">
-                      <span className="math-lhs">Ver Edge Filter:</span>
-                      <span className="math-rhs">pred[0,y] = Clip3(0, 255, pred[0,y] + ((p[-1,y] - p[-1,-1]) &gt;&gt; 1))</span>
-                    </div>
-                  )}
-                </div>
-
-                <div style={{ marginTop: '10px', fontSize: '0.74rem', color: '#333', lineHeight: 1.4 }}>
-                  • Residual signal represents the remaining error to be transformed (DCT/DST) and quantized.<br />
-                  • Total RDO Cost = Distortion + λ · Mode Bits.
-                </div>
-              </div>
-            </div>
-
-            {/* OUTPUT CARD */}
-            <div className="stage-io-arrow-col">
-              <div className="stage-io-arrow">→</div>
-              <span className="process-label">piResi[8×8]</span>
-            </div>
-
-            <div className="stage-io-col">
-              <span className="io-col-badge" style={{ background: 'var(--c-magenta)', color: '#FFF' }}>OUTPUT: RESIDUAL</span>
-              <div className="stage-io-card">
-                <div className="io-meta-line"><strong>Variable:</strong> <code>piResi</code> (Residual Matrix)</div>
-                <div className="io-meta-line"><strong>Dimensions:</strong> 8 × 8 (64 Signed Integers)</div>
-                <div className="io-meta-line"><strong>RDO Cost:</strong> {modeData?.cost?.toFixed(1) || '0.0'}</div>
-
-                <div className="io-visual-box" style={{ marginTop: '10px' }}>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 16px)', gridTemplateRows: 'repeat(8, 16px)' }}>
-                    {resiData.map((v, i) => {
-                      const intensity = Math.min(1, Math.abs(v) / 64);
-                      const bg = v === 0 ? '#E6E6E6' : (v > 0 ? `rgba(222,0,106,${intensity})` : `rgba(245,130,32,${intensity})`);
-                      return (
-                        <div key={i} style={{ backgroundColor: bg, color: intensity>0.5?'#FFF':'#000', fontSize: '0.45rem', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                          {v > 0 ? `+${v}` : v}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-                <span className="io-caption">Signed difference matrix sent to Transform</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* 5. VIEWS 2-5: STAGES 01-04 DETAIL BREAKDOWNS */}
+      <StageDetailSection
+        activeTab={activeTab}
+        channel={channel}
+        selectedMode={selectedMode}
+        modeInfo={modeInfo}
+        N={N}
+        totalPixels={totalPixels}
+        ctuX={ctuX}
+        ctuY={ctuY}
+        imagePreview={imagePreview}
+        refTopRaw={refTopRaw}
+        refLeftRaw={refLeftRaw}
+        refTopActive={refTopActive}
+        isMDISSmoothed={isMDISSmoothed}
+        hasEdgeFilter={hasEdgeFilter}
+        angle={angle}
+        invAngle={invAngle}
+        orgData={orgData}
+        predData={predData}
+        resiData={resiData}
+        modeData={modeData}
+        getSampleColor={getSampleColor}
+      />
     </div>
   );
 };

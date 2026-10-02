@@ -28,6 +28,7 @@ def create_app() -> FastAPI:
         return {
             "status": "healthy",
             "version": settings.VERSION,
+            "encoder_bin": str(settings.ENCODER_BIN),
             "encoder_bin_exists": settings.ENCODER_BIN.exists()
         }
 
@@ -37,6 +38,7 @@ def create_app() -> FastAPI:
         file: UploadFile = File(...),
         ctu_x: int = Form(0),
         ctu_y: int = Form(0),
+        cu_size: int = Form(8),
         scale_mode: str = Form("native")
     ):
         try:
@@ -45,7 +47,7 @@ def create_app() -> FastAPI:
                 image_bytes=content,
                 ctu_x=ctu_x,
                 ctu_y=ctu_y,
-                cu_size=settings.DEFAULT_CU_SIZE,
+                cu_size=cu_size,
                 scale_mode=scale_mode
             )
             return response.model_dump()

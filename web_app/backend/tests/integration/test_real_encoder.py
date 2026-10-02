@@ -122,3 +122,29 @@ def test_real_encoder_sprint3_checkpoints(client, dummy_png_bytes):
     assert "sig_coeff_count" in q_item
     assert len(q_item["quant_coeff"]) == 64
 
+
+@pytest.mark.skipif(not settings.ENCODER_BIN.exists(), reason="TAppEncoder binary not found")
+def test_real_encoder_cu_size_32(client, dummy_png_bytes):
+    """Verify that uploading with cu_size=32 extracts 32x32 intra prediction data with Y, U, V"""
+    files = {"file": ("test_32.png", dummy_png_bytes, "image/png")}
+    data = {"ctu_x": "0", "ctu_y": "0", "cu_size": "32"}
+    
+    res = client.post("/upload", files=files, data=data)
+    assert res.status_code == 200
+    json_data = res.json()
+    assert json_data["status"] == "success"
+    assert len(json_data["data"]) > 0
+    first_mode = json_data["data"][0]
+    # Luma 32x32 = 1024 samples
+    assert len(first_mode["org_data"]) == 1024
+    assert len(first_mode["pred_data"]) == 1024
+    # Chroma 16x16 = 256 samples
+    assert "org_u" in first_mode
+    assert len(first_mode["org_u"]) == 256
+    assert "org_v" in first_mode
+    assert len(first_mode["org_v"]) == 256
+    # 2N + 1 ref samples = 65 for 32x32
+    assert len(first_mode["ref_top"]) == 65
+    assert len(first_mode["ref_left"]) == 65
+
+

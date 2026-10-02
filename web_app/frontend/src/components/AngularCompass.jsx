@@ -11,15 +11,21 @@ const AngularCompass = ({ currentMode = 0, onSelectMode }) => {
   const radius = 24;
 
   // Calculate angle in radians for each mode
+  // HEVC Angular Intra prediction forms a continuous 180° arc:
+  // - Mode 2: Diagonal from bottom-left (-45° or -pi/4)
+  // - Mode 10: Horizontal straight right (0° or 0 rad)
+  // - Mode 18: Diagonal from top-left (45° or pi/4)
+  // - Mode 26: Vertical straight down (90° or pi/2)
+  // - Mode 34: Diagonal from top-right (135° or 3pi/4)
   const getModeAngleRad = (mode) => {
     if (mode === 0 || mode === 1) return null;
     const d = INTRA_PRED_ANGLES[mode] ?? 0;
     if (mode >= 18 && mode <= 34) {
       // Vertical: base is down (Math.PI / 2)
-      return Math.PI / 2 - Math.atan(d / 32);
+      return Math.PI / 2 + Math.atan(d / 32);
     } else {
       // Horizontal: base is right (0)
-      return Math.atan(d / 32);
+      return -Math.atan(d / 32);
     }
   };
 
