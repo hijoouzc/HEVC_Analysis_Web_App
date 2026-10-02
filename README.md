@@ -86,8 +86,8 @@ A unified startup script is provided to automate environment initialization, dep
 
 ```bash
 # Clone the repository
-git clone https://github.com/hijoouzc/HEVC_Analysis_Web_App.git
-cd HEVC_Analysis_Web_App
+git clone https://github.com/hijoouzc/HEVC_Analysis_Web.git
+cd HEVC_Analysis_Web
 
 # Run the unified launcher
 ./run_tool.sh
