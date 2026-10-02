@@ -19,28 +19,39 @@ Instead of viewing video compression as a black box, this tool instruments the r
 
 ## Key Features
 
-### 1. Interactive Full-Frame CTU / CU Partition Navigator
+### 1. Interactive Full-Frame CTU / CU Partition Navigator (`Frame`)
 - **Hierarchical QuadTree Map**: Visualizes the recursive QuadTree partitioning across the entire frame ($64\times 64 \rightarrow 32\times 32 \rightarrow 16\times 16 \rightarrow 8\times 8$).
 - **Dual Viewport Switcher**: Toggle between the **pristine original image** (100% natural colors) and the **partition map** overlay with keyboard shortcut `T` or toolbar controls.
 - **Direct Spatial Selection**: Click directly on any CTU in the frame to lock focus and navigate seamlessly to intra prediction details.
 - **Resolution Modes**: Supports Native Resolution (1080p full-frame, 510 CTUs) and Fast Mode (640×360, 60 CTUs).
 
-### 2. Deep Intra Prediction Analysis (ITU-T H.265 Standard)
+### 2. YUV Planar Decomposition Viewer (`YUV Planes`)
+- **Tri-Plane Color Space**: Real-time extraction and visualization of Luma ($Y$), Chroma Cb ($U$), and Chroma Cr ($V$) components under 4:2:0 subsampling.
+- **False-Color Heatmap & Tint**: Inspect planar values in Monochrome, Tinted, or Turbo Heatmap color schemes.
+- **Direct Pixel Inspector**: Inspect synchronized Y, U, and V pixel intensity values at any coordinate.
+
+### 3. Hierarchical QuadTree Partition Visualizer (`QuadTree`)
+- **Z-Scan QuadTree Treeview**: Interactive SVG/Canvas view of recursive splits and node coordinates within the active CTU.
+- **CU Inspector**: Mode decisions, depth levels, and direct navigation into Intra Prediction.
+
+### 4. Deep Intra Prediction Analysis (`Intra Prediction`)
 - **35 HEVC Intra Prediction Modes**: Full inspection of Planar (Mode 0), DC (Mode 1), and 33 Angular Directions (Modes 2–34).
 - **Interactive Angular Compass**: 360° directional visualizer displaying intra prediction angles, displacement vectors ($A \cdot d$), and Most Probable Modes (MPM).
 - **Reference Sample Substitution & Filtering**: Complete visibility into unfiltered vs filtered reference samples, Mode-Dependent Intra Smoothing (MDIS 3-tap), and Strong Intra Smoothing ($32\times 32$).
-- **Chroma Subsampling (4:2:0)**: Side-by-side inspection of Luma ($Y$) and Chroma ($Cb, Cr$) components.
+- **4-Stage Pipeline Stepper**: Inspect Overview, Stage 1 (Reference Samples), Stage 2 (Angular Projection), Stage 3 (Spatial Synthesis), and Stage 4 (Boundary Filtering & Residual).
 
-### 3. Synchronized 4-Way Viewport
-- **Quad View Comparison**: Side-by-side synchronized comparison of:
-  1. **Original Block**: Raw input pixel samples.
-  2. **Prediction Block**: Synthesized prediction from the selected intra mode.
-  3. **Residual Heatmap**: Bipolar error visualization (Zero = neutral, Positive = Red, Negative = Blue).
-  4. **Reconstructed Block**: Post-transform and dequantized output block.
+### 5. 2D Transform & RDOQ Quantization Engine (`Transform & Quant`)
+- **2D DCT-II & 2D DST-VII**: Exact mathematical core transforms for $4\times 4$ intra luma (DST-VII) and $8\times 8$ to $32\times 32$ transform blocks (DCT-II).
+- **Frequency Spectrum & Sparsity**: Energy compaction ratio, DC harmonic, zero sparsity ratio, and Coded Block Flags (CBF).
 
-### 4. 2D Transform & Quantization Engine
-- **2D DCT-II & 2D DST-VII**: Exact mathematical core transforms for $4\times 4$ intra luma and $8\times 8$ to $32\times 32$ transform blocks.
-- **RDOQ Quantization Matrix**: Direct coefficient table inspections, Coded Block Flags (CBF), and Rate-Distortion Optimization (RDO) costs.
+### 6. Four Picture Comparison (`Comparison`)
+- **Apple-Inspired Quad View**: Compare Original ($S$), Prediction ($P$), Residual ($R = S - P$), and Reconstructed ($S' = P + R'$).
+- **Interactive Split Wipe Slider**: Drag-to-compare wipe slider between any two pictures.
+- **Residual Gain Booster**: $1\times, 2\times, 4\times, 8\times$ error gain multipliers for subtle residual inspection.
+
+### 7. Synchronized 4-Way Viewport (`4-Way View`)
+- **Synchronized Pixel Inspector**: Click any pixel to immediately inspect aligned values across Original, Prediction, Residual Heatmap, and Reconstructed matrices.
+- **Multi-Layout Flexibility**: Switch between 2×2 Grid and 4-Column Side-by-Side views across $Y$, $Cb$, and $Cr$ channels.
 
 ---
 
@@ -49,7 +60,7 @@ Instead of viewing video compression as a black box, this tool instruments the r
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                   React 19 + Vite Frontend                      │
-│   (Swiss Minimalist Design, Zero Icon Clutter, Responsive Canvas) │
+│   (Apple Minimalist Design, Zero Clutter, Responsive Canvas)     │
 └───────────────────────────────▲──────────────────────────────────┘
                                 │ HTTP / REST JSON
 ┌───────────────────────────────▼──────────────────────────────────┐
@@ -71,23 +82,24 @@ Instead of viewing video compression as a black box, this tool instruments the r
 
 ## Quick Start (One-Click Launch)
 
-A unified startup script is provided to automate environment initialization, dependency installation, and service startup:
+A unified startup script is provided to automate environment initialization, dependency installation, encoder detection/auto-compilation, and service startup:
 
 ```bash
 # Clone the repository
-git clone https://github.com/hijoouzc/HEVC_reference_software.git
-cd HEVC_reference_software
+git clone https://github.com/hijoouzc/HEVC_Analysis_Web_App.git
+cd HEVC_Analysis_Web_App
 
 # Run the unified launcher
 ./run_tool.sh
 ```
 
 The script will:
-1. Detect and verify the compiled HM-16.0 `TAppEncoder` binary.
-2. Initialize the Python virtual environment (`web_app/backend/venv`) and install `requirements.txt`.
-3. Install frontend Node modules (`web_app/frontend/node_modules`).
-4. Launch the FastAPI backend on `http://localhost:8000`.
-5. Launch the React Vite frontend on `http://localhost:5173`.
+1. Verify system prerequisites (`python3`, `npm`, `ffmpeg`).
+2. Detect the compiled HM-16.0 `TAppEncoder` binary (or auto-build it if missing).
+3. Initialize the Python virtual environment (`web_app/backend/venv`) and install `requirements.txt`.
+4. Install frontend Node modules (`web_app/frontend/node_modules`).
+5. Launch the FastAPI backend on `http://localhost:8000`.
+6. Launch the React Vite frontend on `http://localhost:5173`.
 
 Access the application in your browser:
 - **Web Application**: `http://localhost:5173`
@@ -106,13 +118,21 @@ Access the application in your browser:
 - **Node.js 18+** and `npm`
 - **FFmpeg** (installed and available in `PATH`)
 
+**One-line installation on Ubuntu / Debian**:
+```bash
+sudo apt-get update && sudo apt-get install -y build-essential cmake ffmpeg python3-venv nodejs npm
+```
+
 ### 1. Build HM-16.0 Encoder with Visual Instrumentation
 ```bash
-# Build using the root makefile
+# Build optimized Release binary (recommended)
+make TAppEncoder-r -j$(nproc)
+
+# Or build Debug binary:
 make TAppEncoder-d -j$(nproc)
 ```
 The compiled binary will be placed at:
-`bin/umake/gcc-13.3/x86_64/debug/TAppEncoder` (or detected dynamically under `bin/`).
+`bin/umake/gcc-*/x86_64/release/TAppEncoder` (or detected dynamically under `bin/`).
 
 ### 2. Backend Setup
 ```bash
@@ -126,7 +146,7 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# Run automated test suite
+# Run automated test suite (25 tests)
 pytest -v
 
 # Start backend server
@@ -172,7 +192,7 @@ HEVC_reference_software/
 ├── web_app/                      # Fullstack Analysis Platform
 │   ├── backend/                  # FastAPI Application
 │   │   ├── app/                  # Application core, API routers, parsers, engine
-│   │   ├── tests/                # Unit & Integration test suite (24 tests)
+│   │   ├── tests/                # Unit & Integration test suite (25 tests)
 │   │   └── requirements.txt      # Python dependencies
 │   └── frontend/                 # React 19 + Vite Application
 │       ├── src/

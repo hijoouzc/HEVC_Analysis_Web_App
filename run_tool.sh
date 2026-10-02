@@ -10,25 +10,46 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="$SCRIPT_DIR/web_app/backend"
 FRONTEND_DIR="$SCRIPT_DIR/web_app/frontend"
-ENCODER_BIN="${HEVC_ENCODER_BIN:-$SCRIPT_DIR/bin/umake/gcc-13.3/x86_64/debug/TAppEncoder}"
-if [ ! -f "$ENCODER_BIN" ]; then
+
+echo "------------------------------------------------------------"
+echo "  HEVC TRACE-DRIVEN ANALYZER - STARTUP"
+echo "------------------------------------------------------------"
+
+# 0. Check system prerequisites
+command -v python3 >/dev/null 2>&1 || { echo "[ERROR] python3 is required but not installed. Aborting."; exit 1; }
+command -v npm >/dev/null 2>&1 || { echo "[ERROR] npm (Node.js) is required but not installed. Aborting."; exit 1; }
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "[WARN] 'ffmpeg' is not found in PATH. Image conversions may be limited."
+    echo "       Install ffmpeg: 'sudo apt install ffmpeg' (Ubuntu/Debian) or 'brew install ffmpeg' (macOS)."
+fi
+
+# 1. Check HM Encoder binary (Release or Debug)
+ENCODER_BIN="${HEVC_ENCODER_BIN:-}"
+if [ -z "$ENCODER_BIN" ] || [ ! -f "$ENCODER_BIN" ]; then
     FOUND_BIN=$(find "$SCRIPT_DIR/bin" -type f \( -name "TAppEncoder" -o -name "TAppEncoderStatic" \) 2>/dev/null | head -n 1)
     if [ -n "$FOUND_BIN" ] && [ -f "$FOUND_BIN" ]; then
         ENCODER_BIN="$FOUND_BIN"
     fi
 fi
 
-echo "------------------------------------------------------------"
-echo "  HEVC TRACE-DRIVEN ANALYZER - STARTUP"
-echo "------------------------------------------------------------"
+# If not found, attempt automatic compilation
+if [ -z "$ENCODER_BIN" ] || [ ! -f "$ENCODER_BIN" ]; then
+    echo "[INFO] HM Encoder binary not found. Attempting automatic build..."
+    echo "       Running: make TAppEncoder-r -j\$(nproc)..."
+    (cd "$SCRIPT_DIR" && make TAppEncoder-r -j$(nproc 2>/dev/null || echo 4)) || true
+    FOUND_BIN=$(find "$SCRIPT_DIR/bin" -type f \( -name "TAppEncoder" -o -name "TAppEncoderStatic" \) 2>/dev/null | head -n 1)
+    if [ -n "$FOUND_BIN" ] && [ -f "$FOUND_BIN" ]; then
+        ENCODER_BIN="$FOUND_BIN"
+    fi
+fi
 
-# 1. Check HM Encoder binary
-if [ -f "$ENCODER_BIN" ]; then
+if [ -n "$ENCODER_BIN" ] && [ -f "$ENCODER_BIN" ]; then
     echo "[OK] HM Encoder binary detected: $ENCODER_BIN"
     export HEVC_ENCODER_BIN="$ENCODER_BIN"
 else
-    echo "[WARN] HM Encoder binary not found at $ENCODER_BIN"
-    echo "       Please build it using 'make TAppEncoder-d' or cmake if needed."
+    echo "[WARN] HM Encoder binary could not be found or built automatically."
+    echo "       Please compile it manually: 'make TAppEncoder-r -j\$(nproc)'"
 fi
 
 # 2. Check Backend Virtual Environment
